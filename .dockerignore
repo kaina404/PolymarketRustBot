@@ -1,0 +1,10 @@
+# 构建上下文只需 src/ + Cargo.toml + Cargo.lock
+/target
+.env
+bot.log
+.git
+.idea
+_vendor
+image
+README.md
+README.zh-CN.md
