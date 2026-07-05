@@ -98,6 +98,7 @@ Get these from Polymarket → Settings → Builder.
 | `WEB_ENABLED` | `false` | Enable the embedded web control console |
 | `WEB_BIND` | `0.0.0.0:8080` | Web control console bind address |
 | `ADMIN_TOKEN` | none | Web control console Bearer token, required when enabled |
+| `CONTROL_STATE_PATH` | `data/control_state.json` | Persists pause/resume and runtime config across process restarts |
 | `RUST_LOG` | `info` | Log level |
 
 Other settings (CLOB URL, signature type, slippage, order type, position sync, etc.) have sensible defaults. See `.env.example` for the full list with bilingual comments.
@@ -112,9 +113,12 @@ Recommended remote Docker settings:
 WEB_ENABLED=true
 WEB_BIND=0.0.0.0:8080
 ADMIN_TOKEN=a-long-random-secret-token
+CONTROL_STATE_PATH=/app/data/control_state.json
 ```
 
 Expose it only through a fixed domain with HTTPS termination at your reverse proxy. Every API request requires `Authorization: Bearer <ADMIN_TOKEN>`; manual Merge, cancel-all, and shutdown also require backend `confirm=true`. The console does not expose or edit private keys, proxy addresses, Builder credentials, or the CLOB URL.
+
+Persist `/app/data` as a Docker volume if you want pause/resume state and runtime parameter edits to survive container replacement, not only process restarts.
 
 ## Disclaimer
 

@@ -98,6 +98,7 @@ cargo run              # 运行程序
 | `WEB_ENABLED` | `false` | 启用内置 Web 控制台 |
 | `WEB_BIND` | `0.0.0.0:8080` | Web 控制台监听地址 |
 | `ADMIN_TOKEN` | 无 | Web 控制台 Bearer Token，启用时必填 |
+| `CONTROL_STATE_PATH` | `data/control_state.json` | 跨进程重启保留暂停/恢复交易和运行时参数 |
 | `RUST_LOG` | `info` | 日志级别 |
 
 其余参数（CLOB 地址、签名类型、滑点、订单类型、持仓同步等）均有合理默认值，一般无需修改。完整列表与注释见 `.env.example`。
@@ -112,9 +113,12 @@ cargo run              # 运行程序
 WEB_ENABLED=true
 WEB_BIND=0.0.0.0:8080
 ADMIN_TOKEN=一段足够长的随机字符串
+CONTROL_STATE_PATH=/app/data/control_state.json
 ```
 
 请只通过固定域名 + HTTPS 反向代理访问控制台。所有 API 都要求 `Authorization: Bearer <ADMIN_TOKEN>`；手动 Merge、取消全部订单、停止程序还要求后端收到 `confirm=true`。控制台不会暴露或允许修改私钥、代理地址、Builder 凭证、CLOB URL。
+
+如果希望暂停/恢复状态和运行时参数在容器重建后仍保留，请把 `/app/data` 挂载为 Docker 持久卷；仅重启同一个进程/容器时默认路径已经会保留。
 
 ## 免责声明
 

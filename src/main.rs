@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{stdout, IsTerminal};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -139,6 +140,15 @@ fn admin_token_from_env() -> Result<String> {
     } else {
         Ok(token)
     }
+}
+
+fn control_state_path_from_env() -> PathBuf {
+    env::var("CONTROL_STATE_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data/control_state.json"))
 }
 
 /// 判断错误是否为 RPC 限流（429 / rate limit），用于决定是否退避重试。
@@ -305,14 +315,22 @@ async fn handle_command(
 
     match command {
         BotCommand::PauseTrading => {
-            control.set_trading_paused(true, "trading paused from web console");
-            dashboard.with_mut(|d| d.push_event("Trading paused from web console"));
-            CommandResponse::accepted("trading paused")
+            match control.set_trading_paused(true, "trading paused from web console") {
+                Ok(()) => {
+                    dashboard.with_mut(|d| d.push_event("Trading paused from web console"));
+                    CommandResponse::accepted("trading paused")
+                }
+                Err(e) => CommandResponse::rejected(e),
+            }
         }
         BotCommand::ResumeTrading => {
-            control.set_trading_paused(false, "trading resumed from web console");
-            dashboard.with_mut(|d| d.push_event("Trading resumed from web console"));
-            CommandResponse::accepted("trading resumed")
+            match control.set_trading_paused(false, "trading resumed from web console") {
+                Ok(()) => {
+                    dashboard.with_mut(|d| d.push_event("Trading resumed from web console"));
+                    CommandResponse::accepted("trading resumed")
+                }
+                Err(e) => CommandResponse::rejected(e),
+            }
         }
         BotCommand::UpdateRuntimeConfig { patch } => {
             match control.update_runtime_config(&patch, "runtime config updated from web console") {
@@ -502,7 +520,25 @@ async fn main() -> Result<()> {
 
     let order_mode = format!("{:?}", config.arbitrage_order_type);
     let dashboard = DashboardHandle::new_live(order_mode, config.risk_max_exposure_usdc);
-    let control = ControlHandle::new(runtime_config_from_config(&config));
+    let control_state_path = control_state_path_from_env();
+    let control = ControlHandle::with_persistence(
+        runtime_config_from_config(&config),
+        control_state_path.clone(),
+    )
+    .map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to load control state from {}: {err}",
+            control_state_path.display()
+        )
+    })?;
+    info!(
+        path = %control_state_path.display(),
+        trading_paused = control.trading_paused(),
+        "Control state persistence enabled"
+    );
+    if control.trading_paused() {
+        dashboard.with_mut(|d| d.push_event("Trading paused by persisted control state"));
+    }
     let (command_tx, command_rx) = mpsc::channel::<CommandRequest>(32);
     if use_tui {
         spawn_dashboard_thread(dashboard.arc(), shutdown.clone());
@@ -971,9 +1007,26 @@ async fn main() -> Result<()> {
                             match get_positions().await {
                                 Ok(positions) => {
                                     let mut redeemed: HashSet<B256> = HashSet::new();
+                                    // Only redeem winning positions. On a resolved market the losing
+                                    // outcome has cur_price==0 (zero payout): redeeming it burns
+                                    // worthless tokens, returns no collateral, and only wastes gas —
+                                    // and reverts with "execution reverted, data: 0x" when the EOA's
+                                    // POL is low relative to the estimateGas fee cap (the node caps
+                                    // the gas allowance at balance/maxFeePerGas; below the redeem's
+                                    // gas the Safe inner call runs out of gas and reverts GS013).
+                                    // Skip zero-value positions; winners have cur_price>0.
+                                    let skipped_worthless = positions
+                                        .iter()
+                                        .filter(|p| p.redeemable && p.size > dec!(0) && p.cur_price <= dec!(0))
+                                        .count();
+                                    if skipped_worthless > 0 {
+                                        info!(
+                                            "Wind-down: skipped {skipped_worthless} resolved losing positions (payout 0, nothing to redeem)"
+                                        );
+                                    }
                                     for pos in positions
                                         .iter()
-                                        .filter(|p| p.redeemable && p.size > dec!(0))
+                                        .filter(|p| p.redeemable && p.size > dec!(0) && p.cur_price > dec!(0))
                                     {
                                         // pUSD redemption (default) redeems the whole condition at
                                         // once, so redeem each condition_id only once per round.

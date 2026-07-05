@@ -157,6 +157,21 @@ impl TradingExecutor {
         let no_token_id = U256::from_str(&opp.no_token_id.to_string())?;
 
         let order_size = Self::capped_order_size(opp.yes_size, opp.no_size, max_order_size);
+
+        // Guard: if either leg's size < 5 (Polymarket min order size), skip the whole pair
+        // to avoid one leg filling and leaving a one-sided exposure. Both legs share
+        // order_size, so a single return means neither Up nor Down is placed.
+        if order_size < dec!(5) {
+            warn!(
+                "⏭️ Skip arbitrage pair | size:{} < min 5 shares | market:{}",
+                order_size, opp.market_id
+            );
+            return Err(anyhow::anyhow!(
+                "order size {} below minimum 5 shares",
+                order_size
+            ));
+        }
+
         let pair_id = Uuid::new_v4().to_string();
         let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
 

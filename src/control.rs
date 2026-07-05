@@ -1,5 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
 
@@ -117,6 +120,40 @@ impl RuntimeControlState {
             updated_at: Utc::now(),
         }
     }
+
+    fn from_persisted(persisted: PersistedControlState) -> Self {
+        Self {
+            trading_paused: persisted.trading_paused,
+            merge_running: false,
+            cancel_running: false,
+            shutdown_requested: false,
+            runtime_config: persisted.runtime_config,
+            last_command: None,
+            last_error: None,
+            updated_at: persisted.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PersistedControlState {
+    version: u8,
+    trading_paused: bool,
+    runtime_config: RuntimeConfig,
+    updated_at: DateTime<Utc>,
+}
+
+impl PersistedControlState {
+    const VERSION: u8 = 1;
+
+    fn from_runtime(state: &RuntimeControlState) -> Self {
+        Self {
+            version: Self::VERSION,
+            trading_paused: state.trading_paused,
+            runtime_config: state.runtime_config,
+            updated_at: state.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -149,13 +186,30 @@ impl From<&RuntimeControlState> for ControlSnapshot {
 #[derive(Clone)]
 pub struct ControlHandle {
     inner: Arc<RwLock<RuntimeControlState>>,
+    persistence_path: Option<Arc<PathBuf>>,
 }
 
 impl ControlHandle {
     pub fn new(runtime_config: RuntimeConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(RuntimeControlState::new(runtime_config))),
+            persistence_path: None,
         }
+    }
+
+    pub fn with_persistence(
+        runtime_config: RuntimeConfig,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, String> {
+        let path = path.into();
+        let state = load_persisted_control_state(&path)?
+            .map(RuntimeControlState::from_persisted)
+            .unwrap_or_else(|| RuntimeControlState::new(runtime_config));
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(state)),
+            persistence_path: Some(Arc::new(path)),
+        })
     }
 
     pub fn snapshot(&self) -> ControlSnapshot {
@@ -177,12 +231,18 @@ impl ControlHandle {
             .trading_paused
     }
 
-    pub fn set_trading_paused(&self, paused: bool, command: impl Into<String>) {
-        self.update(|state| {
+    pub fn set_trading_paused(
+        &self,
+        paused: bool,
+        command: impl Into<String>,
+    ) -> Result<(), String> {
+        let command = command.into();
+        self.update_persistent(|state| {
             state.trading_paused = paused;
-            state.last_command = Some(command.into());
+            state.last_command = Some(command);
             state.last_error = None;
-        });
+            Ok(())
+        })
     }
 
     pub fn set_merge_running(&self, running: bool) {
@@ -210,18 +270,15 @@ impl ControlHandle {
         patch: &RuntimeConfigPatch,
         command: impl Into<String>,
     ) -> Result<RuntimeConfig, String> {
-        let mut guard = self.inner.write().expect("control state lock");
-        let mut next = guard.runtime_config;
-        patch.apply_to(&mut next).map_err(|err| {
-            guard.last_error = Some(err.clone());
-            guard.updated_at = Utc::now();
-            err
-        })?;
-        guard.runtime_config = next;
-        guard.last_command = Some(command.into());
-        guard.last_error = None;
-        guard.updated_at = Utc::now();
-        Ok(next)
+        let command = command.into();
+        self.update_persistent(|state| {
+            let mut next = state.runtime_config;
+            patch.apply_to(&mut next)?;
+            state.runtime_config = next;
+            state.last_command = Some(command);
+            state.last_error = None;
+            Ok(next)
+        })
     }
 
     pub fn record_command(&self, command: impl Into<String>) {
@@ -242,6 +299,97 @@ impl ControlHandle {
         f(&mut guard);
         guard.updated_at = Utc::now();
     }
+
+    fn update_persistent<R>(
+        &self,
+        f: impl FnOnce(&mut RuntimeControlState) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let mut guard = self.inner.write().expect("control state lock");
+        let original = guard.clone();
+
+        match f(&mut guard) {
+            Ok(value) => {
+                guard.updated_at = Utc::now();
+                if let Err(err) = self.persist_locked(&guard) {
+                    *guard = original;
+                    return Err(err);
+                }
+                Ok(value)
+            }
+            Err(err) => {
+                guard.last_error = Some(err.clone());
+                guard.updated_at = Utc::now();
+                Err(err)
+            }
+        }
+    }
+
+    fn persist_locked(&self, state: &RuntimeControlState) -> Result<(), String> {
+        let Some(path) = &self.persistence_path else {
+            return Ok(());
+        };
+        save_persisted_control_state(path, &PersistedControlState::from_runtime(state))
+    }
+}
+
+fn load_persisted_control_state(path: &Path) -> Result<Option<PersistedControlState>, String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed to read control state {}: {err}",
+                path.display()
+            ));
+        }
+    };
+
+    let state: PersistedControlState = serde_json::from_str(&contents)
+        .map_err(|err| format!("failed to parse control state {}: {err}", path.display()))?;
+    if state.version != PersistedControlState::VERSION {
+        return Err(format!(
+            "unsupported control state version {} in {}",
+            state.version,
+            path.display()
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn save_persisted_control_state(path: &Path, state: &PersistedControlState) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create control state directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    let bytes = serde_json::to_vec_pretty(state).map_err(|err| {
+        format!(
+            "failed to serialize control state {}: {err}",
+            path.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("control_state.json");
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+
+    fs::write(&tmp_path, bytes).map_err(|err| {
+        format!(
+            "failed to write control state {}: {err}",
+            tmp_path.display()
+        )
+    })?;
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("failed to replace control state {}: {err}", path.display())
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -325,6 +473,17 @@ impl CommandRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_control_state_path() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "polypulse-control-state-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        path
+    }
 
     #[test]
     fn runtime_config_patch_updates_only_supplied_fields() {
@@ -389,15 +548,57 @@ mod tests {
     fn control_handle_tracks_pause_and_last_command() {
         let handle = ControlHandle::new(RuntimeConfig::default());
 
-        handle.set_trading_paused(true, "operator paused");
+        handle
+            .set_trading_paused(true, "operator paused")
+            .expect("pause");
         let snapshot = handle.snapshot();
         assert!(snapshot.trading_paused);
         assert_eq!(snapshot.last_command.as_deref(), Some("operator paused"));
 
-        handle.set_trading_paused(false, "operator resumed");
+        handle
+            .set_trading_paused(false, "operator resumed")
+            .expect("resume");
         let snapshot = handle.snapshot();
         assert!(!snapshot.trading_paused);
         assert_eq!(snapshot.last_command.as_deref(), Some("operator resumed"));
+    }
+
+    #[test]
+    fn control_handle_restores_persistent_state_after_restart() {
+        let path = temp_control_state_path();
+        let mut restarted_config = RuntimeConfig::default();
+        restarted_config.max_order_size_usdc = 250.0;
+
+        {
+            let handle = ControlHandle::with_persistence(RuntimeConfig::default(), path.clone())
+                .expect("create persistent control handle");
+            handle
+                .set_trading_paused(true, "operator paused")
+                .expect("persist pause");
+            handle
+                .update_runtime_config(
+                    &RuntimeConfigPatch {
+                        max_order_size_usdc: Some(42.0),
+                        arbitrage_execution_spread: Some(0.03),
+                        ..RuntimeConfigPatch::default()
+                    },
+                    "operator updated config",
+                )
+                .expect("persist runtime config");
+            handle.set_merge_running(true);
+            handle.set_cancel_running(true);
+        }
+
+        let restored = ControlHandle::with_persistence(restarted_config, path.clone())
+            .expect("restore persistent control handle");
+        let snapshot = restored.snapshot();
+        assert!(snapshot.trading_paused);
+        assert_eq!(snapshot.runtime_config.max_order_size_usdc, 42.0);
+        assert_eq!(snapshot.runtime_config.arbitrage_execution_spread, 0.03);
+        assert!(!snapshot.merge_running);
+        assert!(!snapshot.cancel_running);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
