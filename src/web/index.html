@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Polypulse Control Console</title>
+  <title>Polypulse 控制台</title>
   <style>
     :root {
       color-scheme: dark;
@@ -206,37 +206,37 @@
   <div class="shell">
     <header>
       <div>
-        <h1>Polypulse Control Console</h1>
-        <div class="muted" id="subtitle">Waiting for authenticated status</div>
+        <h1>Polypulse 控制台(Control Console)</h1>
+        <div class="muted" id="subtitle">等待授权状态(Waiting for authenticated status)</div>
       </div>
       <div class="token-bar">
-        <input id="token" type="password" autocomplete="current-password" placeholder="Admin token" />
-        <button id="save-token">Save Token</button>
+        <input id="token" type="password" autocomplete="current-password" placeholder="管理令牌(Admin token)" />
+        <button id="save-token">保存令牌(Save Token)</button>
       </div>
     </header>
 
     <section class="band">
-      <div class="metric"><div class="label">Session PnL</div><div class="value" id="session-pnl">$0.00</div></div>
-      <div class="metric"><div class="label">Window PnL</div><div class="value" id="window-pnl">$0.00</div></div>
-      <div class="metric"><div class="label">Exposure</div><div class="value" id="exposure">$0.00</div></div>
-      <div class="metric"><div class="label">Window</div><div class="value" id="window">--:--</div></div>
-      <div class="metric"><div class="label">Trades</div><div class="value" id="trades">0 / 0</div></div>
-      <div class="metric"><div class="label">Scans</div><div class="value" id="scans">0</div></div>
+      <div class="metric"><div class="label">本场盈亏(Session PnL)</div><div class="value" id="session-pnl">$0.00</div></div>
+      <div class="metric"><div class="label">窗口盈亏(Window PnL)</div><div class="value" id="window-pnl">$0.00</div></div>
+      <div class="metric"><div class="label">敞口(Exposure)</div><div class="value" id="exposure">$0.00</div></div>
+      <div class="metric"><div class="label">窗口(Window)</div><div class="value" id="window">--:--</div></div>
+      <div class="metric"><div class="label">成交(Trades)</div><div class="value" id="trades">0 / 0</div></div>
+      <div class="metric"><div class="label">扫描(Scans)</div><div class="value" id="scans">0</div></div>
     </section>
 
     <section class="grid">
       <div class="panel">
-        <h2>Status</h2>
+        <h2>状态(Status)</h2>
         <div class="status-row" id="status-row"></div>
       </div>
       <div class="panel">
-        <h2>Controls</h2>
+        <h2>控制(Controls)</h2>
         <div class="actions">
-          <button class="warn" data-action="pause">Pause Trading</button>
-          <button class="primary" data-action="resume">Resume Trading</button>
-          <button class="warn" data-action="merge">Run Merge</button>
-          <button class="danger" data-action="cancel">Cancel Orders</button>
-          <button class="danger" data-action="shutdown">Shutdown</button>
+          <button class="warn" data-action="pause">暂停交易(Pause Trading)</button>
+          <button class="primary" data-action="resume">恢复交易(Resume Trading)</button>
+          <button class="warn" data-action="merge">执行合并(Run Merge)</button>
+          <button class="danger" data-action="cancel">撤销订单(Cancel Orders)</button>
+          <button class="danger" data-action="shutdown">关闭机器人(Shutdown)</button>
         </div>
         <div class="message" id="command-message"></div>
       </div>
@@ -244,36 +244,36 @@
 
     <section class="grid">
       <div class="panel">
-        <h2>Markets</h2>
+        <h2>市场(Markets)</h2>
         <table>
           <thead>
             <tr>
-              <th>Symbol</th>
+              <th>标的(Symbol)</th>
               <th>YES</th>
               <th>NO</th>
-              <th>Total</th>
-              <th>Edge</th>
+              <th>合计(Total)</th>
+              <th>价差(Edge)</th>
             </tr>
           </thead>
           <tbody id="markets"></tbody>
         </table>
       </div>
       <div class="panel">
-        <h2>Runtime Config</h2>
+        <h2>运行时配置(Runtime Config)</h2>
         <div class="config-grid">
-          <label><span>Max order size USDC</span><input id="cfg-max-order" type="number" min="0.01" step="0.01" /></label>
-          <label><span>Execution spread</span><input id="cfg-spread" type="number" min="0" max="0.99" step="0.001" /></label>
-          <label><span>Stop arbitrage before end min</span><input id="cfg-stop" type="number" min="0" step="1" /></label>
-          <label><span>Wind-down before end min</span><input id="cfg-wind" type="number" min="0" step="1" /></label>
-          <label><span>Min YES price</span><input id="cfg-yes" type="number" min="0" max="1" step="0.001" /></label>
-          <label><span>Min NO price</span><input id="cfg-no" type="number" min="0" max="1" step="0.001" /></label>
+          <label><span>最大下单量 USDC(Max order size)</span><input id="cfg-max-order" type="number" min="0.01" step="0.01" /></label>
+          <label><span>执行价差(Execution spread)</span><input id="cfg-spread" type="number" min="0" max="0.99" step="0.001" /></label>
+          <label><span>结束前停止套利·分钟(Stop before end)</span><input id="cfg-stop" type="number" min="0" step="1" /></label>
+          <label><span>结束前减仓·分钟(Wind-down before end)</span><input id="cfg-wind" type="number" min="0" step="1" /></label>
+          <label><span>最低 YES 价格(Min YES price)</span><input id="cfg-yes" type="number" min="0" max="1" step="0.001" /></label>
+          <label><span>最低 NO 价格(Min NO price)</span><input id="cfg-no" type="number" min="0" max="1" step="0.001" /></label>
         </div>
-        <p><button class="primary" id="save-config">Apply Config</button></p>
+        <p><button class="primary" id="save-config">应用配置(Apply Config)</button></p>
       </div>
     </section>
 
     <section class="panel" style="margin-top:16px">
-      <h2>Events</h2>
+      <h2>事件(Events)</h2>
       <ul class="events" id="events"></ul>
     </section>
   </div>
@@ -285,13 +285,21 @@
 
     document.getElementById('save-token').addEventListener('click', () => {
       localStorage.setItem('polypulse_admin_token', tokenInput.value.trim());
-      message.textContent = 'Token saved for this browser.';
+      message.textContent = '令牌已保存到本浏览器(Token saved)';
       refresh();
     });
 
     const fmtMoney = (n) => `${n >= 0 ? '' : '-'}$${Math.abs(Number(n || 0)).toFixed(2)}`;
     const fmtPct = (n) => `${Number(n || 0).toFixed(2)}%`;
+    const dirLabel = (d) => ({ up: '涨', down: '跌', flat: '平' }[d] || d);
     const token = () => tokenInput.value.trim();
+
+    // 配置表单“脏标记”：用户一旦开始编辑，暂停从服务器回填，避免 2 秒轮询把输入覆盖掉。
+    let configDirty = false;
+    const configFieldIds = ['cfg-max-order', 'cfg-spread', 'cfg-stop', 'cfg-wind', 'cfg-yes', 'cfg-no'];
+    configFieldIds.forEach((id) => {
+      document.getElementById(id).addEventListener('input', () => { configDirty = true; });
+    });
 
     async function api(path, options = {}) {
       const headers = Object.assign({
@@ -311,16 +319,16 @@
     function renderStatus(data) {
       const c = data.control;
       const rows = [
-        ['Connected', data.connected, data.connected ? 'ok' : 'warn'],
-        ['Trading', c.trading_paused ? 'Paused' : 'Active', c.trading_paused ? 'warn' : 'ok'],
-        ['Merge', c.merge_running ? 'Running' : 'Idle', c.merge_running ? 'warn' : 'ok'],
-        ['Cancel', c.cancel_running ? 'Running' : 'Idle', c.cancel_running ? 'warn' : 'ok'],
-        ['Shutdown', c.shutdown_requested ? 'Requested' : 'No', c.shutdown_requested ? 'err' : 'ok']
+        ['连接(Connected)', data.connected ? '是' : '否', data.connected ? 'ok' : 'warn'],
+        ['交易(Trading)', c.trading_paused ? '暂停(Paused)' : '活跃(Active)', c.trading_paused ? 'warn' : 'ok'],
+        ['合并(Merge)', c.merge_running ? '运行中(Running)' : '空闲(Idle)', c.merge_running ? 'warn' : 'ok'],
+        ['撤单(Cancel)', c.cancel_running ? '运行中(Running)' : '空闲(Idle)', c.cancel_running ? 'warn' : 'ok'],
+        ['关闭(Shutdown)', c.shutdown_requested ? '已请求(Requested)' : '否(No)', c.shutdown_requested ? 'err' : 'ok']
       ];
       document.getElementById('status-row').innerHTML = rows
         .map(([label, value, cls]) => `<span class="pill ${cls}">${label}: ${value}</span>`)
         .join('');
-      document.getElementById('subtitle').textContent = `${data.window_label} · uptime ${data.uptime}`;
+      document.getElementById('subtitle').textContent = `${data.window_label} · 运行时长(uptime) ${data.uptime}`;
     }
 
     function renderMetrics(data) {
@@ -338,8 +346,8 @@
       document.getElementById('markets').innerHTML = (data.markets || []).map((m) => `
         <tr>
           <td>${m.symbol}</td>
-          <td>${Number(m.yes_price).toFixed(4)} ${m.yes_dir}</td>
-          <td>${Number(m.no_price).toFixed(4)} ${m.no_dir}</td>
+          <td>${Number(m.yes_price).toFixed(4)} ${dirLabel(m.yes_dir)}</td>
+          <td>${Number(m.no_price).toFixed(4)} ${dirLabel(m.no_dir)}</td>
           <td>${Number(m.total_price).toFixed(4)}</td>
           <td class="${m.edge_pct > 0 ? 'pos' : ''}">${fmtPct(m.edge_pct)}</td>
         </tr>
@@ -347,6 +355,7 @@
     }
 
     function renderConfig(config) {
+      if (configDirty) return; // 正在编辑，跳过回填，避免覆盖用户输入
       document.getElementById('cfg-max-order').value = config.max_order_size_usdc;
       document.getElementById('cfg-spread').value = config.arbitrage_execution_spread;
       document.getElementById('cfg-stop').value = config.stop_arbitrage_before_end_minutes;
@@ -364,7 +373,7 @@
 
     async function refresh() {
       if (!token()) {
-        message.textContent = 'Enter admin token to load dashboard.';
+        message.textContent = '请输入管理令牌以加载仪表盘(Enter admin token)';
         return;
       }
       try {
@@ -382,7 +391,11 @@
 
     async function sendAction(action) {
       const highRisk = ['merge', 'cancel', 'shutdown'].includes(action);
-      if (highRisk && !window.confirm(`Confirm ${action}?`)) return;
+      const actionLabels = {
+        pause: '暂停交易', resume: '恢复交易', merge: '执行合并',
+        cancel: '撤销订单', shutdown: '关闭机器人'
+      };
+      if (highRisk && !window.confirm(`确认要${actionLabels[action]}吗？`)) return;
       const map = {
         pause: ['/api/control/pause', undefined],
         resume: ['/api/control/resume', undefined],
@@ -419,9 +432,10 @@
       try {
         const res = await api('/api/control/config', { method: 'PATCH', body: JSON.stringify(body) });
         message.textContent = res.message;
+        configDirty = false; // 应用成功后恢复同步，回填服务器确认的值
         refresh();
       } catch (err) {
-        message.textContent = err.message;
+        message.textContent = err.message; // 校验失败时保留 configDirty，方便用户修正
       }
     });
 
