@@ -131,10 +131,14 @@ impl TradingExecutor {
         first_taking_amount > dec!(0)
     }
 
-    /// FOK/FAK never leave a resting remainder, so their legs are sent
-    /// concurrently (no gating) and reconciled without a grace wait. GTC/GTD rest
-    /// in the book and must stay gated & sequential.
+    /// FOK/FAK never leave a resting remainder; GTD rests are cancelled after
+    /// the post-submit grace window. These order types can submit both legs
+    /// concurrently. GTC can rest forever and stays gated & sequential.
     fn is_concurrent_order_type(order_type: &OrderType) -> bool {
+        matches!(order_type, OrderType::FOK | OrderType::FAK | OrderType::GTD)
+    }
+
+    fn is_terminal_ioc_order_type(order_type: &OrderType) -> bool {
         matches!(order_type, OrderType::FOK | OrderType::FAK)
     }
 
@@ -246,7 +250,7 @@ impl TradingExecutor {
         Self::decimal_from_units(size_units - (size_units % multiple), 2)
     }
 
-    /// Execute arbitrage: submit YES+NO via sequential post_order (V2); order type from config
+    /// Execute arbitrage: submit YES+NO via V2; concurrency depends on order type.
     /// yes_dir / no_dir: direction "↑" "↓" "−" or "" for slippage (down=second, up/flat=first)
     pub async fn execute_arbitrage_pair(
         &self,
@@ -268,8 +272,9 @@ impl TradingExecutor {
     ) -> Result<OrderPairResult> {
         let total_start = Instant::now();
 
-        // FOK/FAK never leave a resting (naked) remainder, so their two legs are
-        // fired concurrently (no gating). GTC/GTD stay gated & sequential.
+        // FOK/FAK and GTD fire both legs concurrently. FOK/FAK are terminal IOC
+        // orders; GTD rests are cancelled after the grace window and recorded.
+        // GTC stays gated & sequential because it can rest forever.
         let concurrent = Self::is_concurrent_order_type(&self.arbitrage_order_type);
 
         let expiry_info = if matches!(self.arbitrage_order_type, OrderType::GTD) {
@@ -429,18 +434,20 @@ impl TradingExecutor {
         let send_start = Instant::now();
 
         let (yes_result, no_result) = if concurrent {
-            // ===== Concurrent send (FOK/FAK) =====
-            // FOK/FAK never rest as a naked remainder (unfillable size is killed),
-            // so the gating GTC/GTD need is unnecessary. Fire both legs at once:
-            // wall-clock ≈ a single round-trip, removing the second-leg delay that
-            // let prices move away under sequential gating.
+            // ===== Concurrent send (FOK/FAK/GTD) =====
+            // Fire both legs at once: wall-clock ~= a single round-trip, removing
+            // the second-leg delay that let prices move away under sequential
+            // gating.
             //
-            // Concurrency does NOT eliminate one-sided fills — a leg can still fill
-            // while the other is killed. That residual is reconciled downstream
-            // (market-unwind). The extra case handled here is a *submit* failure on
-            // one leg while the other filled: unwind the filled leg immediately so
-            // we never sit naked.
-            debug!("Concurrent send (FOK/FAK); no gating | {}", &pair_id[..8]);
+            // Concurrency does NOT eliminate one-sided fills. FOK/FAK residuals
+            // are terminal and reconciled by re-hedge/unwind. GTD rests are
+            // cancelled after the grace window; any final imbalance is left to
+            // the normal position/wind-down lifecycle.
+            debug!(
+                "Concurrent send ({}); no pre-submit gating | {}",
+                self.arbitrage_order_type,
+                &pair_id[..8]
+            );
             let (yes_r, no_r) = tokio::join!(
                 self.client.post_order(signed_yes),
                 self.client.post_order(signed_no),
@@ -456,14 +463,25 @@ impl TradingExecutor {
             match (yes_r, no_r) {
                 (Ok(y), Ok(n)) => (y, n),
                 (Ok(y), Err(e)) => {
-                    if y.taking_amount > dec!(0) {
+                    if Self::is_terminal_ioc_order_type(&self.arbitrage_order_type) {
+                        if y.taking_amount > dec!(0) {
+                            warn!(
+                                "⚠️ NO submit failed but YES filled {} → market-unwind YES | {}",
+                                y.taking_amount,
+                                &pair_id[..8]
+                            );
+                            self.market_unwind_leg(yes_token_id, "YES", y.taking_amount, &pair_id)
+                                .await;
+                        }
+                    } else {
+                        let y_filled = self
+                            .cancel_resting_and_final_matched(&y, "YES", &pair_id)
+                            .await;
                         warn!(
-                            "⚠️ NO submit failed but YES filled {} → market-unwind YES | {}",
-                            y.taking_amount,
+                            "⚠️ NO submit failed; cancelled GTD YES remainder after fill {} | {}",
+                            y_filled,
                             &pair_id[..8]
                         );
-                        self.market_unwind_leg(yes_token_id, "YES", y.taking_amount, &pair_id)
-                            .await;
                     }
                     return Self::log_send_error(
                         &pair_id,
@@ -478,14 +496,25 @@ impl TradingExecutor {
                     );
                 }
                 (Err(e), Ok(n)) => {
-                    if n.taking_amount > dec!(0) {
+                    if Self::is_terminal_ioc_order_type(&self.arbitrage_order_type) {
+                        if n.taking_amount > dec!(0) {
+                            warn!(
+                                "⚠️ YES submit failed but NO filled {} → market-unwind NO | {}",
+                                n.taking_amount,
+                                &pair_id[..8]
+                            );
+                            self.market_unwind_leg(no_token_id, "NO", n.taking_amount, &pair_id)
+                                .await;
+                        }
+                    } else {
+                        let n_filled = self
+                            .cancel_resting_and_final_matched(&n, "NO", &pair_id)
+                            .await;
                         warn!(
-                            "⚠️ YES submit failed but NO filled {} → market-unwind NO | {}",
-                            n.taking_amount,
+                            "⚠️ YES submit failed; cancelled GTD NO remainder after fill {} | {}",
+                            n_filled,
                             &pair_id[..8]
                         );
-                        self.market_unwind_leg(no_token_id, "NO", n.taking_amount, &pair_id)
-                            .await;
                     }
                     return Self::log_send_error(
                         &pair_id,
@@ -520,12 +549,12 @@ impl TradingExecutor {
                 }
             }
         } else {
-            // ===== Gated sequential send (GTC/GTD) =====
+            // ===== Gated sequential send (GTC) =====
             // Fire the pricier leg first, and only fire the second leg once the
-            // first has actually filled. A GTC/GTD first leg that rests unfilled
-            // could still fill later, so it is cancelled and the second leg skipped
-            // — closing the "cheap leg fills alone, pricier leg misses → one-sided
-            // (naked) position" gap.
+            // first has actually filled. A GTC first leg that rests unfilled
+            // could still fill later, so it is cancelled and the second leg
+            // skipped — closing the "cheap leg fills alone, pricier leg misses
+            // → one-sided (naked) position" gap.
             let yes_first = yes_price_with_slippage >= no_price_with_slippage;
             let (first_signed, second_signed, first_side, second_side) = if yes_first {
                 (signed_yes, signed_no, "YES", "NO")
@@ -551,9 +580,9 @@ impl TradingExecutor {
             };
 
             if !Self::should_send_second_leg(first_res.taking_amount) {
-                // First leg didn't fill immediately. A GTC/GTD order rests in the
-                // book and could still fill later, re-creating the one-sided risk,
-                // so cancel it best-effort and skip the second leg entirely.
+                // First leg didn't fill immediately. A GTC order rests in the book
+                // and could still fill later, re-creating the one-sided risk, so
+                // cancel it best-effort and skip the second leg entirely.
                 if let Err(e) = self.client.cancel_order(&first_res.order_id).await {
                     warn!(
                         "⚠️ Failed to cancel unfilled first leg ({}) | id:{} | err:{}",
@@ -608,31 +637,36 @@ impl TradingExecutor {
             total_elapsed
         );
 
-        // Reconcile if the legs came back unbalanced. Concurrent (FOK/FAK) fills are
-        // terminal, so instead of a passive grace-wait we actively try to complete
-        // the under-filled leg (profit-gated) before unwinding. GTC/GTD keep the
-        // scheme-B grace-wait-then-unwind path.
-        let (yes_filled, no_filled) = if concurrent {
-            self.reconcile_concurrent_rehedge(
-                &pair_id,
-                &yes_result,
-                yes_token_id,
-                yes_price_with_slippage,
-                &no_result,
-                no_token_id,
-                no_price_with_slippage,
-            )
-            .await
-        } else {
-            self.reconcile_pair_after_grace(
-                &pair_id,
-                &yes_result,
-                yes_token_id,
-                &no_result,
-                no_token_id,
-            )
-            .await
-        };
+        // Reconcile if the legs came back unbalanced. Concurrent FOK/FAK fills
+        // are terminal, so actively try to complete the under-filled leg
+        // (profit-gated) before unwinding. Concurrent GTD orders can still rest,
+        // so cancel after the grace window and record final matched sizes without
+        // forcing an unwind. Sequential GTC uses the original gated path.
+        let (yes_filled, no_filled) =
+            if Self::is_terminal_ioc_order_type(&self.arbitrage_order_type) {
+                self.reconcile_concurrent_rehedge(
+                    &pair_id,
+                    &yes_result,
+                    yes_token_id,
+                    yes_price_with_slippage,
+                    &no_result,
+                    no_token_id,
+                    no_price_with_slippage,
+                )
+                .await
+            } else if concurrent {
+                self.reconcile_concurrent_resting_after_grace(&pair_id, &yes_result, &no_result)
+                    .await
+            } else {
+                self.reconcile_pair_after_grace(
+                    &pair_id,
+                    &yes_result,
+                    yes_token_id,
+                    &no_result,
+                    no_token_id,
+                )
+                .await
+            };
 
         if yes_filled == dec!(0) && no_filled == dec!(0) {
             let yes_error_msg = yes_result.error_msg.as_deref().unwrap_or("unknown error");
@@ -853,6 +887,46 @@ impl TradingExecutor {
             .map(|o| o.size_matched)
     }
 
+    async fn cancel_resting_order(&self, order_id: &str, side: &str, pair_id: &str) {
+        if order_id.is_empty() {
+            return;
+        }
+        if let Err(e) = self.client.cancel_order(order_id).await {
+            warn!(
+                "⚠️ Failed to cancel resting {} leg | id:{} | err:{} | {}",
+                side,
+                order_id,
+                e,
+                &pair_id[..8]
+            );
+        }
+    }
+
+    async fn cancel_resting_and_final_matched(
+        &self,
+        res: &PostOrderResponse,
+        side: &str,
+        pair_id: &str,
+    ) -> Decimal {
+        self.cancel_resting_order(&res.order_id, side, pair_id)
+            .await;
+        if res.order_id.is_empty() {
+            return res.taking_amount;
+        }
+        match self.matched_size(&res.order_id).await {
+            Some(size) => size,
+            None => {
+                warn!(
+                    "⚠️ Could not query final matched size for {} after cancel; using immediate fill {} | {}",
+                    side,
+                    res.taking_amount,
+                    &pair_id[..8]
+                );
+                res.taking_amount
+            }
+        }
+    }
+
     /// Best (highest) bid price for a token, independent of book ordering.
     async fn best_bid(&self, token: U256) -> Option<Decimal> {
         let req = OrderBookSummaryRequest::builder().token_id(token).build();
@@ -969,9 +1043,47 @@ impl TradingExecutor {
         }
     }
 
+    /// Reconciliation for concurrent resting orders (currently GTD). The goal is
+    /// only to stop remaining exposure from drifting after both legs were fired:
+    /// wait the grace window, cancel both remainders, and return final matched
+    /// sizes. It deliberately does not re-hedge or market-unwind any imbalance.
+    async fn reconcile_concurrent_resting_after_grace(
+        &self,
+        pair_id: &str,
+        yes_res: &PostOrderResponse,
+        no_res: &PostOrderResponse,
+    ) -> (Decimal, Decimal) {
+        let grace = self.hedge_grace_secs;
+        debug!(
+            "GTD concurrent orders posted; grace {}s then cancel remainders | {}",
+            grace,
+            &pair_id[..8]
+        );
+        if grace > 0 {
+            tokio::time::sleep(Duration::from_secs(grace)).await;
+        }
+
+        let (yes_final, no_final) = tokio::join!(
+            self.cancel_resting_and_final_matched(yes_res, "YES", pair_id),
+            self.cancel_resting_and_final_matched(no_res, "NO", pair_id),
+        );
+
+        let residual = ((yes_final - no_final).abs() * dec!(100)).floor() / dec!(100);
+        if residual >= dec!(5) {
+            warn!(
+                "⚖️ GTD concurrent final imbalance YES {} / NO {}; no auto-unwind | {}",
+                yes_final,
+                no_final,
+                &pair_id[..8]
+            );
+        }
+
+        (yes_final, no_final)
+    }
+
     /// Scheme B reconciliation for an imbalanced pair. Fast no-op when the legs
     /// are already balanced within the 5-share minimum. Otherwise waits the grace
-    /// period (letting GTD rests fill), cancels remainders, and market-unwinds the
+    /// period (letting GTC rests fill), cancels remainders, and market-unwinds the
     /// over-filled leg at best-bid minus 2 ticks. Best-effort: any query/cancel/
     /// sell failure is logged and the pair is left for wind-down. Returns the
     /// (adjusted) fills for position bookkeeping.
@@ -991,9 +1103,8 @@ impl TradingExecutor {
             return (yes_immediate, no_immediate);
         }
 
-        // GTC/GTD rest in the book, so give the lagging leg a grace period to fill
-        // before reconciling. (Concurrent FOK/FAK are handled by
-        // reconcile_concurrent_rehedge and never reach here.)
+        // GTC rests in the book, so give the lagging leg a grace period to fill
+        // before reconciling. Concurrent FOK/FAK and GTD never reach here.
         let grace = self.hedge_grace_secs;
         warn!(
             "⚖️ Legs unbalanced (YES {} / NO {}); grace {}s then reconcile | {}",
@@ -1209,13 +1320,14 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_send_only_for_fill_or_kill_order_types() {
-        // FOK/FAK are killed if unfillable → no naked rest → safe to send both
-        // legs concurrently. GTC/GTD rest in the book → must stay gated.
+    fn concurrent_send_includes_gtd_but_not_gtc() {
+        // FOK/FAK are terminal and GTD has an expiry plus post-submit
+        // reconciliation, so these can send both legs concurrently. GTC can rest
+        // forever and must stay gated.
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FOK));
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FAK));
+        assert!(TradingExecutor::is_concurrent_order_type(&OrderType::GTD));
         assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTC));
-        assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTD));
     }
 
     #[test]
