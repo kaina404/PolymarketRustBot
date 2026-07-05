@@ -2,13 +2,14 @@ use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 use anyhow::Result;
 use chrono::Utc;
+use polymarket_client_sdk_v2::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk_v2::clob::types::response::{CancelOrdersResponse, PostOrderResponse};
 use polymarket_client_sdk_v2::clob::types::{OrderType, Side};
 use polymarket_client_sdk_v2::types::{Decimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -33,6 +34,7 @@ pub struct TradingExecutor {
     slippage: [Decimal; 2], // [first, second]: down uses second, up/flat uses first
     gtd_expiration_secs: u64,
     arbitrage_order_type: OrderType,
+    hedge_grace_secs: u64,
 }
 
 impl TradingExecutor {
@@ -43,6 +45,7 @@ impl TradingExecutor {
         slippage: [f64; 2],
         gtd_expiration_secs: u64,
         arbitrage_order_type: OrderType,
+        hedge_grace_secs: u64,
     ) -> Self {
         Self {
             client,
@@ -55,6 +58,7 @@ impl TradingExecutor {
             ],
             gtd_expiration_secs,
             arbitrage_order_type,
+            hedge_grace_secs,
         }
     }
 
@@ -367,8 +371,12 @@ impl TradingExecutor {
             total_elapsed
         );
 
-        let yes_filled = yes_result.taking_amount;
-        let no_filled = no_result.taking_amount;
+        // Reconcile if the legs came back unbalanced (scheme B): give the lagging
+        // leg a grace period to fill, then cancel remainders and market-unwind
+        // whichever leg over-filled, so we don't sit on a one-sided position.
+        let (yes_filled, no_filled) = self
+            .reconcile_pair_after_grace(&pair_id, &yes_result, yes_token_id, &no_result, no_token_id)
+            .await;
 
         if yes_filled == dec!(0) && no_filled == dec!(0) {
             let yes_error_msg = yes_result.error_msg.as_deref().unwrap_or("unknown error");
@@ -541,6 +549,149 @@ impl TradingExecutor {
         );
         Err(anyhow::anyhow!("V2 order API failed: {}", e))
     }
+
+    /// Given both legs' final fills, decide the unwind action. Returns
+    /// `Some((unwind_yes, shares))` — `unwind_yes == true` means sell the YES leg
+    /// — or `None` when the imbalance is below Polymarket's 5-share minimum order
+    /// size and therefore cannot be unwound.
+    fn unwind_plan(yes_final: Decimal, no_final: Decimal) -> Option<(bool, Decimal)> {
+        let imbalance = ((yes_final - no_final).abs() * dec!(100)).floor() / dec!(100);
+        if imbalance < dec!(5) {
+            return None;
+        }
+        Some((yes_final > no_final, imbalance))
+    }
+
+    /// Final matched size for an order via CLOB order lookup.
+    async fn matched_size(&self, order_id: &str) -> Option<Decimal> {
+        self.client
+            .order(order_id)
+            .await
+            .ok()
+            .map(|o| o.size_matched)
+    }
+
+    /// Best (highest) bid price for a token, independent of book ordering.
+    async fn best_bid(&self, token: U256) -> Option<Decimal> {
+        let req = OrderBookSummaryRequest::builder().token_id(token).build();
+        let book = self.client.order_book(&req).await.ok()?;
+        book.bids
+            .iter()
+            .map(|lvl| lvl.price)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    /// Scheme B reconciliation for an imbalanced pair. Fast no-op when the legs
+    /// are already balanced within the 5-share minimum. Otherwise waits the grace
+    /// period (letting GTD rests fill), cancels remainders, and market-unwinds the
+    /// over-filled leg at best-bid minus 2 ticks. Best-effort: any query/cancel/
+    /// sell failure is logged and the pair is left for wind-down. Returns the
+    /// (adjusted) fills for position bookkeeping.
+    async fn reconcile_pair_after_grace(
+        &self,
+        pair_id: &str,
+        yes_res: &PostOrderResponse,
+        yes_token: U256,
+        no_res: &PostOrderResponse,
+        no_token: U256,
+    ) -> (Decimal, Decimal) {
+        let yes_immediate = yes_res.taking_amount;
+        let no_immediate = no_res.taking_amount;
+
+        // Fast path: balanced enough that any residual can't be unwound anyway.
+        if Self::unwind_plan(yes_immediate, no_immediate).is_none() {
+            return (yes_immediate, no_immediate);
+        }
+
+        warn!(
+            "⚖️ Legs unbalanced (YES {} / NO {}); grace {}s then reconcile | {}",
+            yes_immediate,
+            no_immediate,
+            self.hedge_grace_secs,
+            &pair_id[..8]
+        );
+        tokio::time::sleep(Duration::from_secs(self.hedge_grace_secs)).await;
+
+        // Cancel any resting remainder on both legs first, so fills stop moving
+        // before we read them and unwind.
+        let _ = self.client.cancel_order(&yes_res.order_id).await;
+        let _ = self.client.cancel_order(&no_res.order_id).await;
+
+        // Read final matched sizes. If either lookup fails we cannot trust the
+        // imbalance, so skip the unwind rather than risk mis-selling a good leg.
+        let (yes_final, no_final) = match (
+            self.matched_size(&yes_res.order_id).await,
+            self.matched_size(&no_res.order_id).await,
+        ) {
+            (Some(y), Some(n)) => (y, n),
+            _ => {
+                warn!(
+                    "⚖️ Could not query final fills; skip unwind to avoid mis-selling | {}",
+                    &pair_id[..8]
+                );
+                return (yes_immediate, no_immediate);
+            }
+        };
+
+        let (unwind_yes, shares) = match Self::unwind_plan(yes_final, no_final) {
+            Some(plan) => plan,
+            None => {
+                let residual = ((yes_final - no_final).abs() * dec!(100)).floor() / dec!(100);
+                if residual > dec!(0) {
+                    warn!(
+                        "⚖️ Residual imbalance {} < 5 shares, cannot unwind (min order size); left for wind-down | {}",
+                        residual,
+                        &pair_id[..8]
+                    );
+                }
+                return (yes_final, no_final);
+            }
+        };
+
+        let over_token = if unwind_yes { yes_token } else { no_token };
+        let over_side = if unwind_yes { "YES" } else { "NO" };
+        let bid = match self.best_bid(over_token).await {
+            Some(b) if b > dec!(0) => b,
+            _ => {
+                warn!(
+                    "⚖️ No bid to unwind {} imbalance {}; left for wind-down | {}",
+                    over_side,
+                    shares,
+                    &pair_id[..8]
+                );
+                return (yes_final, no_final);
+            }
+        };
+        let price = (bid - dec!(0.02)).max(dec!(0.01));
+
+        match self.sell_at_price(over_token, price, shares).await {
+            Ok(r) => {
+                let sold = r.taking_amount;
+                info!(
+                    "⚖️ Unwound {} imbalance | {} shares @ {:.4} → sold {} | {}",
+                    over_side,
+                    shares,
+                    price,
+                    sold,
+                    &pair_id[..8]
+                );
+                if unwind_yes {
+                    (yes_final - sold, no_final)
+                } else {
+                    (yes_final, no_final - sold)
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "⚖️ Unwind sell failed | {} shares | err:{} | left for wind-down | {}",
+                    shares,
+                    e,
+                    &pair_id[..8]
+                );
+                (yes_final, no_final)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -571,5 +722,23 @@ mod tests {
         // Any positive immediate fill → proceed with the hedging second leg.
         assert!(TradingExecutor::should_send_second_leg(dec!(0.01)));
         assert!(TradingExecutor::should_send_second_leg(dec!(10)));
+    }
+
+    #[test]
+    fn unwind_plan_targets_the_over_filled_leg_above_min_size() {
+        // Balanced → nothing to unwind.
+        assert_eq!(TradingExecutor::unwind_plan(dec!(10), dec!(10)), None);
+        // Imbalance below the 5-share minimum → cannot unwind.
+        assert_eq!(TradingExecutor::unwind_plan(dec!(10), dec!(7)), None);
+        // YES over-filled by >= 5 → sell YES for the difference.
+        assert_eq!(
+            TradingExecutor::unwind_plan(dec!(10), dec!(3)),
+            Some((true, dec!(7)))
+        );
+        // NO over-filled by >= 5 → sell NO for the difference.
+        assert_eq!(
+            TradingExecutor::unwind_plan(dec!(2), dec!(10)),
+            Some((false, dec!(8)))
+        );
     }
 }

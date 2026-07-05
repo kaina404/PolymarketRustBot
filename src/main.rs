@@ -609,6 +609,7 @@ async fn main() -> Result<()> {
         config.slippage,
         config.gtd_expiration_secs,
         config.arbitrage_order_type.clone(),
+        config.arbitrage_hedge_grace_secs,
     ));
 
     let _risk_manager = Arc::new(RiskManager::new(clob_client.clone(), &config));

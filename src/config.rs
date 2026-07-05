@@ -51,6 +51,10 @@ pub struct Config {
     /// Slippage [first, second]: down-only uses second, up/flat uses first. e.g. "-0.02,0.0"
     pub slippage: [f64; 2],
     pub gtd_expiration_secs: u64, // GTD order expiry (seconds), default 300 (5 min); only when arbitrage_order_type=GTD
+    /// Grace period (seconds) to let the lagging (second) leg fill before
+    /// reconciling an imbalanced pair: cancel resting remainders and market-unwind
+    /// whichever leg over-filled, avoiding a one-sided position. Default 20.
+    pub arbitrage_hedge_grace_secs: u64,
     /// Order type for arbitrage: GTC (good till cancel), GTD (with gtd_expiration_secs), FOK (fill or kill), FAK (fill and kill remainder)
     pub arbitrage_order_type: OrderType,
     pub stop_arbitrage_before_end_seconds: u64, // Stop arbitrage N seconds before market end, default 0 (no stop)
@@ -134,6 +138,10 @@ impl Config {
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()
                 .unwrap_or(300), // default 300s (5 min)
+            arbitrage_hedge_grace_secs: env::var("ARBITRAGE_HEDGE_GRACE_SECS")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()
+                .unwrap_or(20), // default 20s grace for the second leg
             arbitrage_order_type: parse_arbitrage_order_type(
                 &env::var("ARBITRAGE_ORDER_TYPE").unwrap_or_else(|_| "GTD".to_string()),
             ),
