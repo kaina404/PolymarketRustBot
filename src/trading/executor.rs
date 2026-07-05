@@ -129,6 +129,13 @@ impl TradingExecutor {
         first_taking_amount > dec!(0)
     }
 
+    /// FOK/FAK never leave a resting remainder, so their legs are sent
+    /// concurrently (no gating) and reconciled without a grace wait. GTC/GTD rest
+    /// in the book and must stay gated & sequential.
+    fn is_concurrent_order_type(order_type: &OrderType) -> bool {
+        matches!(order_type, OrderType::FOK | OrderType::FAK)
+    }
+
     /// Execute arbitrage: submit YES+NO via sequential post_order (V2); order type from config
     /// yes_dir / no_dir: direction "↑" "↓" "−" or "" for slippage (down=second, up/flat=first)
     pub async fn execute_arbitrage_pair(
@@ -151,6 +158,10 @@ impl TradingExecutor {
     ) -> Result<OrderPairResult> {
         let total_start = Instant::now();
 
+        // FOK/FAK never leave a resting (naked) remainder, so their two legs are
+        // fired concurrently (no gating). GTC/GTD stay gated & sequential.
+        let concurrent = Self::is_concurrent_order_type(&self.arbitrage_order_type);
+
         let expiry_info = if matches!(self.arbitrage_order_type, OrderType::GTD) {
             format!("expiry:{}s", self.gtd_expiration_secs)
         } else {
@@ -160,7 +171,8 @@ impl TradingExecutor {
             market_id = %opp.market_id,
             profit_pct = %opp.profit_percentage,
             order_type = %self.arbitrage_order_type,
-            "Execute arbitrage (V2 sequential, type:{}, {})",
+            "Execute arbitrage (V2 {}, type:{}, {})",
+            if concurrent { "concurrent" } else { "sequential" },
             self.arbitrage_order_type,
             expiry_info
         );
@@ -279,85 +291,166 @@ impl TradingExecutor {
         let sign_elapsed = sign_start.elapsed().as_millis();
 
         let send_start = Instant::now();
-        let yes_first = yes_price_with_slippage >= no_price_with_slippage;
 
-        // Gated sequential send: fire the pricier leg first, and only fire the
-        // second leg once the first has actually filled. If the first leg gets no
-        // immediate fill, cancel any resting remainder and abandon the pair.
-        //
-        // This closes the "cheap leg fills alone, pricier leg misses → one-sided
-        // (naked) position" gap. Previously both legs were sent unconditionally,
-        // so whenever the first leg rested unfilled but the second filled, we were
-        // left holding a single leg (the recurring "only the cheap side got
-        // bought" symptom). Now the second leg is never sent unless the first is
-        // confirmed filled.
-        let (first_signed, second_signed, first_side, second_side) = if yes_first {
-            (signed_yes, signed_no, "YES", "NO")
-        } else {
-            (signed_no, signed_yes, "NO", "YES")
-        };
-
-        let first_res = match self.client.post_order(first_signed).await {
-            Ok(r) => r,
-            Err(e) => {
-                return Self::log_send_error(
-                    &pair_id,
-                    yes_price_with_slippage,
-                    no_price_with_slippage,
-                    order_size,
-                    build_elapsed,
-                    sign_elapsed,
-                    send_start,
-                    total_start,
-                    e,
-                );
-            }
-        };
-
-        if !Self::should_send_second_leg(first_res.taking_amount) {
-            // First leg didn't fill immediately. A GTC/GTD order rests in the book
-            // and could still fill later, re-creating the one-sided risk, so cancel
-            // it best-effort and skip the second leg entirely.
-            if let Err(e) = self.client.cancel_order(&first_res.order_id).await {
-                warn!(
-                    "⚠️ Failed to cancel unfilled first leg ({}) | id:{} | err:{}",
-                    first_side, first_res.order_id, e
-                );
-            }
-            warn!(
-                "⏭️ First leg ({}) unfilled → skip second leg ({}) to avoid one-sided exposure | {}",
-                first_side,
-                second_side,
-                &pair_id[..8]
+        let (yes_result, no_result) = if concurrent {
+            // ===== Concurrent send (FOK/FAK) =====
+            // FOK/FAK never rest as a naked remainder (unfillable size is killed),
+            // so the gating GTC/GTD need is unnecessary. Fire both legs at once:
+            // wall-clock ≈ a single round-trip, removing the second-leg delay that
+            // let prices move away under sequential gating.
+            //
+            // Concurrency does NOT eliminate one-sided fills — a leg can still fill
+            // while the other is killed. That residual is reconciled downstream
+            // (market-unwind). The extra case handled here is a *submit* failure on
+            // one leg while the other filled: unwind the filled leg immediately so
+            // we never sit naked.
+            debug!("Concurrent send (FOK/FAK); no gating | {}", &pair_id[..8]);
+            let (yes_r, no_r) = tokio::join!(
+                self.client.post_order(signed_yes),
+                self.client.post_order(signed_no),
             );
-            return Err(anyhow::anyhow!(
-                "First leg ({}) unfilled; second leg ({}) skipped to avoid one-sided exposure",
-                first_side,
-                second_side
-            ));
-        }
-
-        let second_res = match self.client.post_order(second_signed).await {
-            Ok(r) => r,
-            Err(e) => {
-                return Self::log_send_error(
-                    &pair_id,
-                    yes_price_with_slippage,
-                    no_price_with_slippage,
-                    order_size,
-                    build_elapsed,
-                    sign_elapsed,
-                    send_start,
-                    total_start,
-                    e,
-                );
+            match (yes_r, no_r) {
+                (Ok(y), Ok(n)) => (y, n),
+                (Ok(y), Err(e)) => {
+                    if y.taking_amount > dec!(0) {
+                        warn!(
+                            "⚠️ NO submit failed but YES filled {} → market-unwind YES | {}",
+                            y.taking_amount,
+                            &pair_id[..8]
+                        );
+                        self.market_unwind_leg(yes_token_id, "YES", y.taking_amount, &pair_id)
+                            .await;
+                    }
+                    return Self::log_send_error(
+                        &pair_id,
+                        yes_price_with_slippage,
+                        no_price_with_slippage,
+                        order_size,
+                        build_elapsed,
+                        sign_elapsed,
+                        send_start,
+                        total_start,
+                        e,
+                    );
+                }
+                (Err(e), Ok(n)) => {
+                    if n.taking_amount > dec!(0) {
+                        warn!(
+                            "⚠️ YES submit failed but NO filled {} → market-unwind NO | {}",
+                            n.taking_amount,
+                            &pair_id[..8]
+                        );
+                        self.market_unwind_leg(no_token_id, "NO", n.taking_amount, &pair_id)
+                            .await;
+                    }
+                    return Self::log_send_error(
+                        &pair_id,
+                        yes_price_with_slippage,
+                        no_price_with_slippage,
+                        order_size,
+                        build_elapsed,
+                        sign_elapsed,
+                        send_start,
+                        total_start,
+                        e,
+                    );
+                }
+                (Err(ye), Err(ne)) => {
+                    debug!(
+                        "Both legs submit-failed | YES:{} | NO:{} | {}",
+                        ye,
+                        ne,
+                        &pair_id[..8]
+                    );
+                    return Self::log_send_error(
+                        &pair_id,
+                        yes_price_with_slippage,
+                        no_price_with_slippage,
+                        order_size,
+                        build_elapsed,
+                        sign_elapsed,
+                        send_start,
+                        total_start,
+                        ye,
+                    );
+                }
             }
-        };
-
-        let (yes_result, no_result) = if yes_first {
-            (first_res, second_res)
         } else {
-            (second_res, first_res)
+            // ===== Gated sequential send (GTC/GTD) =====
+            // Fire the pricier leg first, and only fire the second leg once the
+            // first has actually filled. A GTC/GTD first leg that rests unfilled
+            // could still fill later, so it is cancelled and the second leg skipped
+            // — closing the "cheap leg fills alone, pricier leg misses → one-sided
+            // (naked) position" gap.
+            let yes_first = yes_price_with_slippage >= no_price_with_slippage;
+            let (first_signed, second_signed, first_side, second_side) = if yes_first {
+                (signed_yes, signed_no, "YES", "NO")
+            } else {
+                (signed_no, signed_yes, "NO", "YES")
+            };
+
+            let first_res = match self.client.post_order(first_signed).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Self::log_send_error(
+                        &pair_id,
+                        yes_price_with_slippage,
+                        no_price_with_slippage,
+                        order_size,
+                        build_elapsed,
+                        sign_elapsed,
+                        send_start,
+                        total_start,
+                        e,
+                    );
+                }
+            };
+
+            if !Self::should_send_second_leg(first_res.taking_amount) {
+                // First leg didn't fill immediately. A GTC/GTD order rests in the
+                // book and could still fill later, re-creating the one-sided risk,
+                // so cancel it best-effort and skip the second leg entirely.
+                if let Err(e) = self.client.cancel_order(&first_res.order_id).await {
+                    warn!(
+                        "⚠️ Failed to cancel unfilled first leg ({}) | id:{} | err:{}",
+                        first_side, first_res.order_id, e
+                    );
+                }
+                warn!(
+                    "⏭️ First leg ({}) unfilled → skip second leg ({}) to avoid one-sided exposure | {}",
+                    first_side,
+                    second_side,
+                    &pair_id[..8]
+                );
+                return Err(anyhow::anyhow!(
+                    "First leg ({}) unfilled; second leg ({}) skipped to avoid one-sided exposure",
+                    first_side,
+                    second_side
+                ));
+            }
+
+            let second_res = match self.client.post_order(second_signed).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Self::log_send_error(
+                        &pair_id,
+                        yes_price_with_slippage,
+                        no_price_with_slippage,
+                        order_size,
+                        build_elapsed,
+                        sign_elapsed,
+                        send_start,
+                        total_start,
+                        e,
+                    );
+                }
+            };
+
+            if yes_first {
+                (first_res, second_res)
+            } else {
+                (second_res, first_res)
+            }
         };
 
         let send_elapsed = send_start.elapsed().as_millis();
@@ -581,6 +674,53 @@ impl TradingExecutor {
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
     }
 
+    /// Market-unwind one over-filled leg at best-bid minus 2 ticks. Best-effort:
+    /// returns the shares actually sold, or 0 if there's no bid or the sell fails
+    /// (logged; the residual is left for wind-down).
+    async fn market_unwind_leg(
+        &self,
+        token: U256,
+        side: &str,
+        shares: Decimal,
+        pair_id: &str,
+    ) -> Decimal {
+        let bid = match self.best_bid(token).await {
+            Some(b) if b > dec!(0) => b,
+            _ => {
+                warn!(
+                    "⚖️ No bid to unwind {} imbalance {}; left for wind-down | {}",
+                    side,
+                    shares,
+                    &pair_id[..8]
+                );
+                return dec!(0);
+            }
+        };
+        let price = (bid - dec!(0.02)).max(dec!(0.01));
+        match self.sell_at_price(token, price, shares).await {
+            Ok(r) => {
+                info!(
+                    "⚖️ Unwound {} imbalance | {} shares @ {:.4} → sold {} | {}",
+                    side,
+                    shares,
+                    price,
+                    r.taking_amount,
+                    &pair_id[..8]
+                );
+                r.taking_amount
+            }
+            Err(e) => {
+                warn!(
+                    "⚖️ Unwind sell failed | {} shares | err:{} | left for wind-down | {}",
+                    shares,
+                    e,
+                    &pair_id[..8]
+                );
+                dec!(0)
+            }
+        }
+    }
+
     /// Scheme B reconciliation for an imbalanced pair. Fast no-op when the legs
     /// are already balanced within the 5-share minimum. Otherwise waits the grace
     /// period (letting GTD rests fill), cancels remainders, and market-unwinds the
@@ -603,14 +743,24 @@ impl TradingExecutor {
             return (yes_immediate, no_immediate);
         }
 
+        // FOK/FAK fills are already terminal — no resting remainder will fill
+        // later — so reconcile immediately; waiting would only leave the naked leg
+        // exposed for hedge_grace_secs longer. GTC/GTD keep the grace wait.
+        let grace = if Self::is_concurrent_order_type(&self.arbitrage_order_type) {
+            0
+        } else {
+            self.hedge_grace_secs
+        };
         warn!(
             "⚖️ Legs unbalanced (YES {} / NO {}); grace {}s then reconcile | {}",
             yes_immediate,
             no_immediate,
-            self.hedge_grace_secs,
+            grace,
             &pair_id[..8]
         );
-        tokio::time::sleep(Duration::from_secs(self.hedge_grace_secs)).await;
+        if grace > 0 {
+            tokio::time::sleep(Duration::from_secs(grace)).await;
+        }
 
         // Cancel any resting remainder on both legs first, so fills stop moving
         // before we read them and unwind.
@@ -650,46 +800,13 @@ impl TradingExecutor {
 
         let over_token = if unwind_yes { yes_token } else { no_token };
         let over_side = if unwind_yes { "YES" } else { "NO" };
-        let bid = match self.best_bid(over_token).await {
-            Some(b) if b > dec!(0) => b,
-            _ => {
-                warn!(
-                    "⚖️ No bid to unwind {} imbalance {}; left for wind-down | {}",
-                    over_side,
-                    shares,
-                    &pair_id[..8]
-                );
-                return (yes_final, no_final);
-            }
-        };
-        let price = (bid - dec!(0.02)).max(dec!(0.01));
-
-        match self.sell_at_price(over_token, price, shares).await {
-            Ok(r) => {
-                let sold = r.taking_amount;
-                info!(
-                    "⚖️ Unwound {} imbalance | {} shares @ {:.4} → sold {} | {}",
-                    over_side,
-                    shares,
-                    price,
-                    sold,
-                    &pair_id[..8]
-                );
-                if unwind_yes {
-                    (yes_final - sold, no_final)
-                } else {
-                    (yes_final, no_final - sold)
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "⚖️ Unwind sell failed | {} shares | err:{} | left for wind-down | {}",
-                    shares,
-                    e,
-                    &pair_id[..8]
-                );
-                (yes_final, no_final)
-            }
+        let sold = self
+            .market_unwind_leg(over_token, over_side, shares, pair_id)
+            .await;
+        if unwind_yes {
+            (yes_final - sold, no_final)
+        } else {
+            (yes_final, no_final - sold)
         }
     }
 }
@@ -740,5 +857,15 @@ mod tests {
             TradingExecutor::unwind_plan(dec!(2), dec!(10)),
             Some((false, dec!(8)))
         );
+    }
+
+    #[test]
+    fn concurrent_send_only_for_fill_or_kill_order_types() {
+        // FOK/FAK are killed if unfillable → no naked rest → safe to send both
+        // legs concurrently. GTC/GTD rest in the book → must stay gated.
+        assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FOK));
+        assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FAK));
+        assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTC));
+        assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTD));
     }
 }
