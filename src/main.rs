@@ -1276,6 +1276,17 @@ async fn main() -> Result<()> {
                                             let no_cost = opp.no_ask_price * order_size;
                                             let total_cost = yes_cost + no_cost;
 
+                                            // Skip if buyable shares < 5 (Polymarket min order size); avoids API 400 "Size lower than the minimum: 5"
+                                            if order_size < dec!(5) {
+                                                debug!(
+                                                    "⏭️ Buyable shares below minimum (5), skip arbitrage | market:{} | size:{} | cost:{:.2} USD",
+                                                    market_display,
+                                                    order_size,
+                                                    total_cost
+                                                );
+                                                continue; // Skip this arbitrage
+                                            }
+
                                             // Check risk exposure limit
                                             let position_tracker = _risk_manager.position_tracker();
                                             let current_exposure = position_tracker.calculate_exposure();
