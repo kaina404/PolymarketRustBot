@@ -117,6 +117,14 @@ impl TradingExecutor {
         yes_size.min(no_size).min(max_order_size)
     }
 
+    /// Whether to send the second (hedging) leg, given the first leg's immediate
+    /// fill amount. Only send the second leg once the first has actually filled —
+    /// otherwise sending it risks a one-sided (naked) position when the first leg
+    /// rests unfilled and the second fills alone.
+    fn should_send_second_leg(first_taking_amount: Decimal) -> bool {
+        first_taking_amount > dec!(0)
+    }
+
     /// Execute arbitrage: submit YES+NO via sequential post_order (V2); order type from config
     /// yes_dir / no_dir: direction "↑" "↓" "−" or "" for slippage (down=second, up/flat=first)
     pub async fn execute_arbitrage_pair(
@@ -269,44 +277,83 @@ impl TradingExecutor {
         let send_start = Instant::now();
         let yes_first = yes_price_with_slippage >= no_price_with_slippage;
 
-        let (yes_result, no_result) = if yes_first {
-            let yes_res = self.client.post_order(signed_yes).await;
-            let no_res = self.client.post_order(signed_no).await;
-            match (yes_res, no_res) {
-                (Ok(y), Ok(n)) => (y, n),
-                (Err(e), _) | (_, Err(e)) => {
-                    return Self::log_send_error(
-                        &pair_id,
-                        yes_price_with_slippage,
-                        no_price_with_slippage,
-                        order_size,
-                        build_elapsed,
-                        sign_elapsed,
-                        send_start,
-                        total_start,
-                        e,
-                    );
-                }
-            }
+        // Gated sequential send: fire the pricier leg first, and only fire the
+        // second leg once the first has actually filled. If the first leg gets no
+        // immediate fill, cancel any resting remainder and abandon the pair.
+        //
+        // This closes the "cheap leg fills alone, pricier leg misses → one-sided
+        // (naked) position" gap. Previously both legs were sent unconditionally,
+        // so whenever the first leg rested unfilled but the second filled, we were
+        // left holding a single leg (the recurring "only the cheap side got
+        // bought" symptom). Now the second leg is never sent unless the first is
+        // confirmed filled.
+        let (first_signed, second_signed, first_side, second_side) = if yes_first {
+            (signed_yes, signed_no, "YES", "NO")
         } else {
-            let no_res = self.client.post_order(signed_no).await;
-            let yes_res = self.client.post_order(signed_yes).await;
-            match (no_res, yes_res) {
-                (Ok(n), Ok(y)) => (y, n),
-                (Err(e), _) | (_, Err(e)) => {
-                    return Self::log_send_error(
-                        &pair_id,
-                        yes_price_with_slippage,
-                        no_price_with_slippage,
-                        order_size,
-                        build_elapsed,
-                        sign_elapsed,
-                        send_start,
-                        total_start,
-                        e,
-                    );
-                }
+            (signed_no, signed_yes, "NO", "YES")
+        };
+
+        let first_res = match self.client.post_order(first_signed).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Self::log_send_error(
+                    &pair_id,
+                    yes_price_with_slippage,
+                    no_price_with_slippage,
+                    order_size,
+                    build_elapsed,
+                    sign_elapsed,
+                    send_start,
+                    total_start,
+                    e,
+                );
             }
+        };
+
+        if !Self::should_send_second_leg(first_res.taking_amount) {
+            // First leg didn't fill immediately. A GTC/GTD order rests in the book
+            // and could still fill later, re-creating the one-sided risk, so cancel
+            // it best-effort and skip the second leg entirely.
+            if let Err(e) = self.client.cancel_order(&first_res.order_id).await {
+                warn!(
+                    "⚠️ Failed to cancel unfilled first leg ({}) | id:{} | err:{}",
+                    first_side, first_res.order_id, e
+                );
+            }
+            warn!(
+                "⏭️ First leg ({}) unfilled → skip second leg ({}) to avoid one-sided exposure | {}",
+                first_side,
+                second_side,
+                &pair_id[..8]
+            );
+            return Err(anyhow::anyhow!(
+                "First leg ({}) unfilled; second leg ({}) skipped to avoid one-sided exposure",
+                first_side,
+                second_side
+            ));
+        }
+
+        let second_res = match self.client.post_order(second_signed).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Self::log_send_error(
+                    &pair_id,
+                    yes_price_with_slippage,
+                    no_price_with_slippage,
+                    order_size,
+                    build_elapsed,
+                    sign_elapsed,
+                    send_start,
+                    total_start,
+                    e,
+                );
+            }
+        };
+
+        let (yes_result, no_result) = if yes_first {
+            (first_res, second_res)
+        } else {
+            (second_res, first_res)
         };
 
         let send_elapsed = send_start.elapsed().as_millis();
@@ -514,5 +561,15 @@ mod tests {
             TradingExecutor::capped_order_size(dec!(50), dec!(9), dec!(25)),
             dec!(9)
         );
+    }
+
+    #[test]
+    fn second_leg_only_sent_when_first_leg_filled() {
+        // No immediate fill on the first leg → do not send the second leg,
+        // preventing a one-sided (naked) position.
+        assert!(!TradingExecutor::should_send_second_leg(dec!(0)));
+        // Any positive immediate fill → proceed with the hedging second leg.
+        assert!(TradingExecutor::should_send_second_leg(dec!(0.01)));
+        assert!(TradingExecutor::should_send_second_leg(dec!(10)));
     }
 }
