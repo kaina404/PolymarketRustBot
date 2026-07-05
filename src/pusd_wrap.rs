@@ -112,6 +112,7 @@ async fn safe_exec_call<P: Provider>(
     if sig_bytes.len() == 65 && (sig_bytes[64] == 0 || sig_bytes[64] == 1) {
         sig_bytes[64] += 27;
     }
+    let (max_fee, max_prio) = crate::proxy_relay::safe_tx_fee_caps();
     let pending = safe
         .execTransaction(
             to,
@@ -125,9 +126,11 @@ async fn safe_exec_call<P: Provider>(
             Address::ZERO,
             sig_bytes.into(),
         )
+        .max_fee_per_gas(max_fee)
+        .max_priority_fee_per_gas(max_prio)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Safe.execTransaction failed: {}", e))?;
+        .map_err(|e| crate::proxy_relay::map_safe_exec_error(e, signer.address()))?;
     let tx_hash_out = *pending.tx_hash();
     let receipt = pending
         .get_receipt()

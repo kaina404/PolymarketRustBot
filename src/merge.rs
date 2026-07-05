@@ -26,7 +26,7 @@ use crate::wallet_kind::{classify_wallet, WalletKind};
 use crate::proxy_relay::{
     self, derive_proxy_wallet, relayer_execute_proxy_calldata, IGnosisSafe, CTF_COLLATERAL_ADAPTER,
     CTF_POLYGON, PROXY_FACTORY, PROXY_MERGE_PUSD_GAS, PUSD_POLYGON, RELAYER_URL_DEFAULT,
-    RPC_URL_DEFAULT, USDC_POLYGON,
+    resolve_rpc_url, USDC_POLYGON,
 };
 
 use alloy::sol;
@@ -367,6 +367,7 @@ async fn safe_exec_call<P: Provider>(
     if sig_bytes.len() == 65 && (sig_bytes[64] == 0 || sig_bytes[64] == 1) {
         sig_bytes[64] += 27;
     }
+    let (max_fee, max_prio) = proxy_relay::safe_tx_fee_caps();
     let pending = safe
         .execTransaction(
             to,
@@ -380,9 +381,11 @@ async fn safe_exec_call<P: Provider>(
             Address::ZERO,
             sig_bytes.into(),
         )
+        .max_fee_per_gas(max_fee)
+        .max_priority_fee_per_gas(max_prio)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Safe.execTransaction failed: {}", e))?;
+        .map_err(|e| proxy_relay::map_safe_exec_error(e, signer.address()))?;
     let tx_hash_out = *pending.tx_hash();
     let receipt = pending
         .get_receipt()
@@ -438,17 +441,17 @@ pub async fn merge_max(
     rpc_url: Option<&str>,
     asset_hint: Option<(U256, U256)>,
 ) -> Result<MergeResult> {
-    let rpc = rpc_url.unwrap_or(RPC_URL_DEFAULT);
+    let rpc = resolve_rpc_url(rpc_url);
     let chain = POLYGON;
     let signer = LocalSigner::from_str(private_key)?.with_chain_id(Some(chain));
     let eoa = signer.address();
 
     let output = if merge_to_pusd() { "pUSD" } else { "USDC.e" };
 
-    let provider = ProviderBuilder::new().wallet(signer.clone()).connect(rpc).await?;
+    let provider = ProviderBuilder::new().wallet(signer.clone()).connect(&rpc).await?;
     let client = Client::new(provider.clone(), chain)?;
     let config = contract_config(chain, false).ok_or_else(|| anyhow::anyhow!("Unsupported chain_id: {}", chain))?;
-    let prov_read = ProviderBuilder::new().connect(rpc).await?;
+    let prov_read = ProviderBuilder::new().connect(&rpc).await?;
     let ctf = config.conditional_tokens;
 
     let resolved = resolve_merge_balances(&client, &prov_read, wallet, condition_id, asset_hint).await?;

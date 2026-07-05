@@ -55,6 +55,21 @@ sol! {
 
 pub const RPC_URL_DEFAULT: &str = "https://polygon-bor-rpc.publicnode.com";
 pub const RELAYER_URL_DEFAULT: &str = "https://relayer-v2.polymarket.com";
+
+/// 解析 Polygon RPC 端点：显式参数 > `RPC_URL` 环境变量 > 内置公共节点。
+/// 内置默认(publicnode/allnodes)为免费共享节点，限流 1200rqs/60s；
+/// 高频或 wind-down 批量赎回时应设 `RPC_URL` 指向私有/付费端点以避开 429。
+pub fn resolve_rpc_url(rpc_url: Option<&str>) -> String {
+    if let Some(u) = rpc_url {
+        if !u.trim().is_empty() {
+            return u.to_string();
+        }
+    }
+    match std::env::var("RPC_URL") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => RPC_URL_DEFAULT.to_string(),
+    }
+}
 /// USDC.e（bridged），V1 及旧持仓抵押品
 pub const USDC_POLYGON: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 /// pUSD（Polymarket USD），V2 抵押品
@@ -86,6 +101,47 @@ pub const PROXY_REDEEM_PUSD_GAS: u64 = 450_000;
 pub const PROXY_REDEEM_LEGACY_GAS: u64 = 220_000;
 /// pUSD CollateralAdapter merge 实测约需 370k+ gas
 pub const PROXY_MERGE_PUSD_GAS: u64 = 450_000;
+
+/// Safe 直发交易的 EIP-1559 费率上限（Polygon）。
+///
+/// alloy 默认把 `maxFeePerGas` 估成约 `2×baseFee + priority`；费率骤升时节点按
+/// `gasLimit × maxFeePerGas` 预扣余额，可能超出 EOA 的 POL 余额而报 `insufficient funds`，
+/// 即便实际结算成本（`gasUsed × effectiveGasPrice`）远低于此。这里给 Safe execTransaction
+/// 一个可配置上限，避免过度预扣；默认 300 gwei maxFee / 30 gwei priority
+/// （远高于 Polygon 常态 ~30-100 gwei，同时又不会像 2×baseFee 那样在骤升时过度预扣）。
+/// 可用 `TX_MAX_FEE_GWEI` / `TX_PRIORITY_FEE_GWEI` 覆盖，返回单位为 wei 的 `(max_fee, priority)`。
+pub fn safe_tx_fee_caps() -> (u128, u128) {
+    fn gwei_env(key: &str, default_gwei: u128) -> u128 {
+        env::var(key)
+            .ok()
+            .and_then(|s| s.trim().parse::<u128>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_gwei)
+            .saturating_mul(1_000_000_000)
+    }
+    let max_fee = gwei_env("TX_MAX_FEE_GWEI", 300);
+    let max_prio = gwei_env("TX_PRIORITY_FEE_GWEI", 30);
+    (max_fee, max_prio.min(max_fee))
+}
+
+/// 判断错误是否为 EOA 原生代币（POL）不足以支付 gas。
+pub fn is_insufficient_funds_error(msg: &str) -> bool {
+    msg.to_lowercase().contains("insufficient funds")
+}
+
+/// 统一映射 Safe execTransaction 发送错误：余额不足时给出充值 POL 的可操作提示。
+pub fn map_safe_exec_error(e: impl std::fmt::Display, eoa: Address) -> anyhow::Error {
+    let msg = e.to_string();
+    if is_insufficient_funds_error(&msg) {
+        anyhow::anyhow!(
+            "Safe.execTransaction failed: 签名地址 {} 的 POL 余额不足以支付 gas，请为其充值 POL（或调低 TX_MAX_FEE_GWEI / 等待 Polygon 费率回落）: {}",
+            eoa,
+            msg
+        )
+    } else {
+        anyhow::anyhow!("Safe.execTransaction failed: {}", msg)
+    }
+}
 
 /// Shorten long 0x-prefixed hex to `0x` + first 8 + `..` + last 6 for logs.
 pub fn short_hex(s: &str) -> String {

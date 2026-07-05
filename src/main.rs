@@ -141,6 +141,14 @@ fn admin_token_from_env() -> Result<String> {
     }
 }
 
+/// 判断错误是否为 RPC 限流（429 / rate limit），用于决定是否退避重试。
+/// 免费公共节点(publicnode/allnodes)限流 1200rqs/60s，错误体形如
+/// "HTTP error 429 with body: Rate limit (1200rqs/60s) reached"（注意大写）。
+fn is_rate_limit_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("rate limit") || m.contains("429") || m.contains("retry in")
+}
+
 /// Run a single Merge pass for all currently mergeable YES+NO positions.
 async fn run_merge_once(
     label: &str,
@@ -193,7 +201,7 @@ async fn run_merge_once(
         let mut result = merge::merge_max(condition_id, proxy, private_key, None, asset_hint).await;
         if result.is_err() {
             let msg = result.as_ref().unwrap_err().to_string();
-            if msg.contains("rate limit") || msg.contains("retry in") {
+            if is_rate_limit_error(&msg) {
                 warn!(
                     condition_id = %condition_id,
                     "RPC rate limit, waiting {}s before retry",
@@ -972,7 +980,7 @@ async fn main() -> Result<()> {
                                         if !redeemed.insert(pos.condition_id) {
                                             continue;
                                         }
-                                        match redeem::redeem_one(
+                                        let mut result = redeem::redeem_one(
                                             pos.condition_id,
                                             pos.negative_risk,
                                             proxy,
@@ -982,8 +990,28 @@ async fn main() -> Result<()> {
                                             None,
                                             &[],
                                         )
-                                        .await
-                                        {
+                                        .await;
+                                        // 免费 RPC 限流(429)时退避重试一次；仍失败则本轮跳过，
+                                        // 下一轮 wind-down 会再次尝试（持仓仍 redeemable）。
+                                        if matches!(&result, Err(e) if is_rate_limit_error(&e.to_string())) {
+                                            warn!(
+                                                condition_id = %pos.condition_id,
+                                                "Wind-down: RPC 限流，等待 12s 后重试 redeem"
+                                            );
+                                            sleep(Duration::from_secs(12)).await;
+                                            result = redeem::redeem_one(
+                                                pos.condition_id,
+                                                pos.negative_risk,
+                                                proxy,
+                                                &config_wd.private_key,
+                                                None,
+                                                None,
+                                                None,
+                                                &[],
+                                            )
+                                            .await;
+                                        }
+                                        match result {
                                             Ok(tx) => {
                                                 info!(
                                                     "✅ Wind-down: redeemed | condition_id={:#x} | tx={}",

@@ -30,7 +30,7 @@ use crate::deposit_wallet_relay::{
 use crate::proxy_relay::{
     derive_proxy_wallet, relayer_execute_proxy_calldata, IGnosisSafe, CTF_COLLATERAL_ADAPTER,
     CTF_POLYGON, NEG_RISK_ADAPTER, NEG_RISK_COLLATERAL_ADAPTER, PROXY_FACTORY,
-    PROXY_REDEEM_LEGACY_GAS, PROXY_REDEEM_PUSD_GAS, RELAYER_URL_DEFAULT, RPC_URL_DEFAULT,
+    resolve_rpc_url, PROXY_REDEEM_LEGACY_GAS, PROXY_REDEEM_PUSD_GAS, RELAYER_URL_DEFAULT,
     USDC_POLYGON, PUSD_POLYGON,
 };
 
@@ -246,6 +246,7 @@ async fn safe_exec_call<P: Provider>(
     if sig_bytes.len() == 65 && (sig_bytes[64] == 0 || sig_bytes[64] == 1) {
         sig_bytes[64] += 27;
     }
+    let (max_fee, max_prio) = crate::proxy_relay::safe_tx_fee_caps();
     let pending = safe
         .execTransaction(
             to,
@@ -259,9 +260,11 @@ async fn safe_exec_call<P: Provider>(
             Address::ZERO,
             sig_bytes.into(),
         )
+        .max_fee_per_gas(max_fee)
+        .max_priority_fee_per_gas(max_prio)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Safe.execTransaction failed: {}", e))?;
+        .map_err(|e| crate::proxy_relay::map_safe_exec_error(e, signer.address()))?;
     let tx_hash_out = *pending.tx_hash();
     let receipt = pending
         .get_receipt()
@@ -296,7 +299,7 @@ pub async fn redeem_one(
     size_raw: Option<U256>,
     verify_assets: &[U256],
 ) -> Result<String> {
-    let rpc = rpc_url.unwrap_or(RPC_URL_DEFAULT);
+    let rpc = resolve_rpc_url(rpc_url);
     let chain = POLYGON;
     let signer = LocalSigner::from_str(private_key)?.with_chain_id(Some(chain));
     let wallet = signer.address();
@@ -310,7 +313,7 @@ pub async fn redeem_one(
         condition_id, neg_risk, redeem_target, output
     );
 
-    let provider = ProviderBuilder::new().wallet(signer.clone()).connect(rpc).await?;
+    let provider = ProviderBuilder::new().wallet(signer.clone()).connect(&rpc).await?;
     let mut balances_before = Vec::new();
     for asset in verify_assets {
         balances_before.push(outcome_balance(&provider, proxy, *asset).await?);
