@@ -1,6 +1,6 @@
-use anyhow::Result;
-use alloy::signers::Signer;
 use alloy::signers::local::LocalSigner;
+use alloy::signers::Signer;
+use anyhow::Result;
 use chrono::Utc;
 use polymarket_client_sdk_v2::clob::types::response::{CancelOrdersResponse, PostOrderResponse};
 use polymarket_client_sdk_v2::clob::types::{OrderType, Side};
@@ -86,8 +86,7 @@ impl TradingExecutor {
         price: Decimal,
         size: Decimal,
     ) -> Result<PostOrderResponse> {
-        let signer = LocalSigner::from_str(&self.private_key)?
-            .with_chain_id(Some(POLYGON));
+        let signer = LocalSigner::from_str(&self.private_key)?.with_chain_id(Some(POLYGON));
         let order = self
             .client
             .limit_order()
@@ -114,6 +113,10 @@ impl TradingExecutor {
         }
     }
 
+    fn capped_order_size(yes_size: Decimal, no_size: Decimal, max_order_size: Decimal) -> Decimal {
+        yes_size.min(no_size).min(max_order_size)
+    }
+
     /// Execute arbitrage: submit YES+NO via sequential post_order (V2); order type from config
     /// yes_dir / no_dir: direction "↑" "↓" "−" or "" for slippage (down=second, up/flat=first)
     pub async fn execute_arbitrage_pair(
@@ -121,6 +124,18 @@ impl TradingExecutor {
         opp: &ArbitrageOpportunity,
         yes_dir: &str,
         no_dir: &str,
+    ) -> Result<OrderPairResult> {
+        self.execute_arbitrage_pair_with_max_order_size(opp, yes_dir, no_dir, self.max_order_size)
+            .await
+    }
+
+    /// Execute arbitrage with an explicit runtime max-order cap.
+    pub async fn execute_arbitrage_pair_with_max_order_size(
+        &self,
+        opp: &ArbitrageOpportunity,
+        yes_dir: &str,
+        no_dir: &str,
+        max_order_size: Decimal,
     ) -> Result<OrderPairResult> {
         let total_start = Instant::now();
 
@@ -141,7 +156,7 @@ impl TradingExecutor {
         let yes_token_id = U256::from_str(&opp.yes_token_id.to_string())?;
         let no_token_id = U256::from_str(&opp.no_token_id.to_string())?;
 
-        let order_size = opp.yes_size.min(opp.no_size).min(self.max_order_size);
+        let order_size = Self::capped_order_size(opp.yes_size, opp.no_size, max_order_size);
         let pair_id = Uuid::new_v4().to_string();
         let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
 
@@ -152,8 +167,7 @@ impl TradingExecutor {
 
         info!(
             "📋 Level | YES {:.4}×{:.2} NO {:.4}×{:.2}",
-            yes_price_with_slippage, order_size,
-            no_price_with_slippage, order_size
+            yes_price_with_slippage, order_size, no_price_with_slippage, order_size
         );
 
         let expiry_suffix = if matches!(self.arbitrage_order_type, OrderType::GTD) {
@@ -163,9 +177,14 @@ impl TradingExecutor {
         };
         info!(
             "📤 Order | YES {:.4}→{:.4}×{} NO {:.4}→{:.4}×{} | {}{}",
-            opp.yes_ask_price, yes_price_with_slippage, order_size,
-            opp.no_ask_price, no_price_with_slippage, order_size,
-            self.arbitrage_order_type, expiry_suffix
+            opp.yes_ask_price,
+            yes_price_with_slippage,
+            order_size,
+            opp.no_ask_price,
+            no_price_with_slippage,
+            order_size,
+            self.arbitrage_order_type,
+            expiry_suffix
         );
 
         let yes_amount_usd = yes_price_with_slippage * order_size;
@@ -177,14 +196,16 @@ impl TradingExecutor {
             );
             return Err(anyhow::anyhow!(
                 "Order size below min: YES {:.2} pUSD, NO {:.2} pUSD; both must be > $1",
-                yes_amount_usd, no_amount_usd
+                yes_amount_usd,
+                no_amount_usd
             ));
         }
 
         let build_start = Instant::now();
         let (yes_order, no_order) = tokio::join!(
             async {
-                let b = self.client
+                let b = self
+                    .client
                     .limit_order()
                     .token_id(yes_token_id)
                     .side(Side::Buy)
@@ -198,7 +219,8 @@ impl TradingExecutor {
                 }
             },
             async {
-                let b = self.client
+                let b = self
+                    .client
                     .limit_order()
                     .token_id(no_token_id)
                     .side(Side::Buy)
@@ -218,8 +240,7 @@ impl TradingExecutor {
         let build_elapsed = build_start.elapsed().as_millis();
 
         let sign_start = Instant::now();
-        let signer = LocalSigner::from_str(&self.private_key)?
-            .with_chain_id(Some(POLYGON));
+        let signer = LocalSigner::from_str(&self.private_key)?.with_chain_id(Some(POLYGON));
 
         let (signed_yes_result, signed_no_result) = tokio::join!(
             self.client.sign(&signer, yes_order),
@@ -277,21 +298,19 @@ impl TradingExecutor {
         let total_elapsed = total_start.elapsed().as_millis();
         info!(
             "⏱️ Latency | {} | build {}ms sign {}ms send {}ms total {}ms",
-            &pair_id[..8], build_elapsed, sign_elapsed, send_elapsed, total_elapsed
+            &pair_id[..8],
+            build_elapsed,
+            sign_elapsed,
+            send_elapsed,
+            total_elapsed
         );
 
         let yes_filled = yes_result.taking_amount;
         let no_filled = no_result.taking_amount;
 
         if yes_filled == dec!(0) && no_filled == dec!(0) {
-            let yes_error_msg = yes_result
-                .error_msg
-                .as_deref()
-                .unwrap_or("unknown error");
-            let no_error_msg = no_result
-                .error_msg
-                .as_deref()
-                .unwrap_or("unknown error");
+            let yes_error_msg = yes_result.error_msg.as_deref().unwrap_or("unknown error");
+            let no_error_msg = no_result.error_msg.as_deref().unwrap_or("unknown error");
 
             let yes_error_simple = if yes_error_msg.contains("no orders found to match") {
                 "No matching orders in orderbook"
@@ -343,14 +362,8 @@ impl TradingExecutor {
         }
 
         if !yes_result.success || !no_result.success {
-            let yes_error_msg = yes_result
-                .error_msg
-                .as_deref()
-                .unwrap_or("unknown error");
-            let no_error_msg = no_result
-                .error_msg
-                .as_deref()
-                .unwrap_or("unknown error");
+            let yes_error_msg = yes_result.error_msg.as_deref().unwrap_or("unknown error");
+            let no_error_msg = no_result.error_msg.as_deref().unwrap_or("unknown error");
 
             let yes_error_simple = if yes_error_msg.contains("no orders found to match") {
                 "Partially unfilled (order posted)"
@@ -407,11 +420,18 @@ impl TradingExecutor {
             );
         } else if yes_filled > dec!(0) || no_filled > dec!(0) {
             let side = if yes_filled > dec!(0) { "YES" } else { "NO" };
-            let filled = if yes_filled > dec!(0) { yes_filled } else { no_filled };
+            let filled = if yes_filled > dec!(0) {
+                yes_filled
+            } else {
+                no_filled
+            };
             let other_side = if yes_filled > dec!(0) { "NO" } else { "YES" };
             warn!(
                 "⚠️ One-sided fill | {} | {} filled {}, {} unfilled (handed to risk)",
-                &pair_id[..8], side, filled, other_side
+                &pair_id[..8],
+                side,
+                filled,
+                other_side
             );
         } else {
             warn!(
@@ -458,5 +478,26 @@ impl TradingExecutor {
             e
         );
         Err(anyhow::anyhow!("V2 order API failed: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capped_order_size_uses_smallest_available_size_and_runtime_cap() {
+        assert_eq!(
+            TradingExecutor::capped_order_size(dec!(50), dec!(40), dec!(25)),
+            dec!(25)
+        );
+        assert_eq!(
+            TradingExecutor::capped_order_size(dec!(12), dec!(40), dec!(25)),
+            dec!(12)
+        );
+        assert_eq!(
+            TradingExecutor::capped_order_size(dec!(50), dec!(9), dec!(25)),
+            dec!(9)
+        );
     }
 }

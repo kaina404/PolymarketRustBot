@@ -95,9 +95,26 @@ cargo run              # 运行程序
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | 每轮最大风险敞口 |
 | `MERGE_INTERVAL_MINUTES` | `0` | 定时 Merge 间隔（分钟），`0` 为关闭 |
 | `WIND_DOWN_BEFORE_WINDOW_END_MINUTES` | `0` | 窗口结束前收尾（分钟），`0` 为关闭 |
+| `WEB_ENABLED` | `false` | 启用内置 Web 控制台 |
+| `WEB_BIND` | `0.0.0.0:8080` | Web 控制台监听地址 |
+| `ADMIN_TOKEN` | 无 | Web 控制台 Bearer Token，启用时必填 |
 | `RUST_LOG` | `info` | 日志级别 |
 
 其余参数（CLOB 地址、签名类型、滑点、订单类型、持仓同步等）均有合理默认值，一般无需修改。完整列表与注释见 `.env.example`。
+
+### Web 控制台
+
+启用后，Rust 进程会同时运行交易机器人和一个内置 Web 控制台。控制台提供状态查看、暂停/恢复交易、手动 Merge、取消全部订单、停止程序，以及修改部分运行时参数。
+
+远程 Docker 部署建议：
+
+```bash
+WEB_ENABLED=true
+WEB_BIND=0.0.0.0:8080
+ADMIN_TOKEN=一段足够长的随机字符串
+```
+
+请只通过固定域名 + HTTPS 反向代理访问控制台。所有 API 都要求 `Authorization: Bearer <ADMIN_TOKEN>`；手动 Merge、取消全部订单、停止程序还要求后端收到 `confirm=true`。控制台不会暴露或允许修改私钥、代理地址、Builder 凭证、CLOB URL。
 
 ## 免责声明
 

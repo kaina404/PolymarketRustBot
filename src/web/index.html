@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Polypulse Control Console</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101114;
+      --panel: #171a20;
+      --panel-2: #1f242c;
+      --line: #303743;
+      --text: #eef1f5;
+      --muted: #9ca6b5;
+      --accent: #61d394;
+      --warn: #f0b35b;
+      --danger: #f36f73;
+      --info: #6ab7ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    button, input {
+      font: inherit;
+    }
+    .shell {
+      width: min(1440px, 100%);
+      margin: 0 auto;
+      padding: 20px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 0 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 720;
+    }
+    .token-bar {
+      display: grid;
+      grid-template-columns: minmax(180px, 320px) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    input {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      background: #0e1014;
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 6px;
+    }
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 7px 12px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--info); }
+    button.primary { background: #1d4734; border-color: #2f7651; }
+    button.warn { background: #493318; border-color: #8c642b; }
+    button.danger { background: #4e2024; border-color: #8e3a40; }
+    .grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 16px;
+      margin-top: 18px;
+    }
+    .band, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .band {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 1px;
+      overflow: hidden;
+      margin-top: 18px;
+    }
+    .metric {
+      padding: 14px;
+      background: var(--panel);
+      min-width: 0;
+    }
+    .metric .label {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .metric .value {
+      margin-top: 4px;
+      font-size: 22px;
+      font-weight: 740;
+      overflow-wrap: anywhere;
+    }
+    .panel {
+      padding: 14px;
+      min-width: 0;
+    }
+    .panel h2 {
+      margin: 0 0 12px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 28px;
+      padding: 4px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: #12151a;
+    }
+    .pill.ok { color: var(--accent); border-color: #2f7651; }
+    .pill.warn { color: var(--warn); border-color: #8c642b; }
+    .pill.err { color: var(--danger); border-color: #8e3a40; }
+    .actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 6px;
+      text-align: right;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    th:first-child, td:first-child { text-align: left; }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 12px;
+    }
+    .config-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    label span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .events {
+      max-height: 360px;
+      overflow: auto;
+      padding: 0;
+      margin: 0;
+      list-style: none;
+    }
+    .events li {
+      padding: 8px 0;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+    .muted { color: var(--muted); }
+    .pos { color: var(--accent); }
+    .neg { color: var(--danger); }
+    .message {
+      min-height: 20px;
+      color: var(--muted);
+      margin-top: 10px;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 980px) {
+      header, .grid { grid-template-columns: 1fr; display: grid; }
+      .band { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .token-bar, .config-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <h1>Polypulse Control Console</h1>
+        <div class="muted" id="subtitle">Waiting for authenticated status</div>
+      </div>
+      <div class="token-bar">
+        <input id="token" type="password" autocomplete="current-password" placeholder="Admin token" />
+        <button id="save-token">Save Token</button>
+      </div>
+    </header>
+
+    <section class="band">
+      <div class="metric"><div class="label">Session PnL</div><div class="value" id="session-pnl">$0.00</div></div>
+      <div class="metric"><div class="label">Window PnL</div><div class="value" id="window-pnl">$0.00</div></div>
+      <div class="metric"><div class="label">Exposure</div><div class="value" id="exposure">$0.00</div></div>
+      <div class="metric"><div class="label">Window</div><div class="value" id="window">--:--</div></div>
+      <div class="metric"><div class="label">Trades</div><div class="value" id="trades">0 / 0</div></div>
+      <div class="metric"><div class="label">Scans</div><div class="value" id="scans">0</div></div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <h2>Status</h2>
+        <div class="status-row" id="status-row"></div>
+      </div>
+      <div class="panel">
+        <h2>Controls</h2>
+        <div class="actions">
+          <button class="warn" data-action="pause">Pause Trading</button>
+          <button class="primary" data-action="resume">Resume Trading</button>
+          <button class="warn" data-action="merge">Run Merge</button>
+          <button class="danger" data-action="cancel">Cancel Orders</button>
+          <button class="danger" data-action="shutdown">Shutdown</button>
+        </div>
+        <div class="message" id="command-message"></div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <h2>Markets</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>YES</th>
+              <th>NO</th>
+              <th>Total</th>
+              <th>Edge</th>
+            </tr>
+          </thead>
+          <tbody id="markets"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>Runtime Config</h2>
+        <div class="config-grid">
+          <label><span>Max order size USDC</span><input id="cfg-max-order" type="number" min="0.01" step="0.01" /></label>
+          <label><span>Execution spread</span><input id="cfg-spread" type="number" min="0" max="0.99" step="0.001" /></label>
+          <label><span>Stop arbitrage before end min</span><input id="cfg-stop" type="number" min="0" step="1" /></label>
+          <label><span>Wind-down before end min</span><input id="cfg-wind" type="number" min="0" step="1" /></label>
+          <label><span>Min YES price</span><input id="cfg-yes" type="number" min="0" max="1" step="0.001" /></label>
+          <label><span>Min NO price</span><input id="cfg-no" type="number" min="0" max="1" step="0.001" /></label>
+        </div>
+        <p><button class="primary" id="save-config">Apply Config</button></p>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top:16px">
+      <h2>Events</h2>
+      <ul class="events" id="events"></ul>
+    </section>
+  </div>
+
+  <script>
+    const tokenInput = document.getElementById('token');
+    const message = document.getElementById('command-message');
+    tokenInput.value = localStorage.getItem('polypulse_admin_token') || '';
+
+    document.getElementById('save-token').addEventListener('click', () => {
+      localStorage.setItem('polypulse_admin_token', tokenInput.value.trim());
+      message.textContent = 'Token saved for this browser.';
+      refresh();
+    });
+
+    const fmtMoney = (n) => `${n >= 0 ? '' : '-'}$${Math.abs(Number(n || 0)).toFixed(2)}`;
+    const fmtPct = (n) => `${Number(n || 0).toFixed(2)}%`;
+    const token = () => tokenInput.value.trim();
+
+    async function api(path, options = {}) {
+      const headers = Object.assign({
+        'Authorization': `Bearer ${token()}`
+      }, options.headers || {});
+      if (options.body) headers['Content-Type'] = 'application/json';
+      const res = await fetch(path, Object.assign({}, options, { headers }));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+      return data;
+    }
+
+    function setText(id, value) {
+      document.getElementById(id).textContent = value;
+    }
+
+    function renderStatus(data) {
+      const c = data.control;
+      const rows = [
+        ['Connected', data.connected, data.connected ? 'ok' : 'warn'],
+        ['Trading', c.trading_paused ? 'Paused' : 'Active', c.trading_paused ? 'warn' : 'ok'],
+        ['Merge', c.merge_running ? 'Running' : 'Idle', c.merge_running ? 'warn' : 'ok'],
+        ['Cancel', c.cancel_running ? 'Running' : 'Idle', c.cancel_running ? 'warn' : 'ok'],
+        ['Shutdown', c.shutdown_requested ? 'Requested' : 'No', c.shutdown_requested ? 'err' : 'ok']
+      ];
+      document.getElementById('status-row').innerHTML = rows
+        .map(([label, value, cls]) => `<span class="pill ${cls}">${label}: ${value}</span>`)
+        .join('');
+      document.getElementById('subtitle').textContent = `${data.window_label} · uptime ${data.uptime}`;
+    }
+
+    function renderMetrics(data) {
+      setText('session-pnl', fmtMoney(data.session_pnl));
+      setText('window-pnl', fmtMoney(data.window_pnl));
+      setText('exposure', `${fmtMoney(data.exposure)} / ${fmtMoney(data.exposure_limit)}`);
+      setText('window', data.window_countdown);
+      setText('trades', `${data.successful_trades} / ${data.total_trades}`);
+      setText('scans', String(data.arb_scans));
+      document.getElementById('session-pnl').className = data.session_pnl >= 0 ? 'value pos' : 'value neg';
+      document.getElementById('window-pnl').className = data.window_pnl >= 0 ? 'value pos' : 'value neg';
+    }
+
+    function renderMarkets(data) {
+      document.getElementById('markets').innerHTML = (data.markets || []).map((m) => `
+        <tr>
+          <td>${m.symbol}</td>
+          <td>${Number(m.yes_price).toFixed(4)} ${m.yes_dir}</td>
+          <td>${Number(m.no_price).toFixed(4)} ${m.no_dir}</td>
+          <td>${Number(m.total_price).toFixed(4)}</td>
+          <td class="${m.edge_pct > 0 ? 'pos' : ''}">${fmtPct(m.edge_pct)}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderConfig(config) {
+      document.getElementById('cfg-max-order').value = config.max_order_size_usdc;
+      document.getElementById('cfg-spread').value = config.arbitrage_execution_spread;
+      document.getElementById('cfg-stop').value = config.stop_arbitrage_before_end_minutes;
+      document.getElementById('cfg-wind').value = config.wind_down_before_window_end_minutes;
+      document.getElementById('cfg-yes').value = config.min_yes_price_threshold;
+      document.getElementById('cfg-no').value = config.min_no_price_threshold;
+    }
+
+    function renderEvents(events) {
+      document.getElementById('events').innerHTML = (events || [])
+        .slice().reverse()
+        .map((item) => `<li>${item}</li>`)
+        .join('');
+    }
+
+    async function refresh() {
+      if (!token()) {
+        message.textContent = 'Enter admin token to load dashboard.';
+        return;
+      }
+      try {
+        const data = await api('/api/dashboard');
+        renderStatus(data);
+        renderMetrics(data);
+        renderMarkets(data);
+        renderConfig(data.control.runtime_config);
+        renderEvents(data.events);
+        message.textContent = data.control.last_error || data.control.last_command || '';
+      } catch (err) {
+        message.textContent = err.message;
+      }
+    }
+
+    async function sendAction(action) {
+      const highRisk = ['merge', 'cancel', 'shutdown'].includes(action);
+      if (highRisk && !window.confirm(`Confirm ${action}?`)) return;
+      const map = {
+        pause: ['/api/control/pause', undefined],
+        resume: ['/api/control/resume', undefined],
+        merge: ['/api/control/merge-now', { confirm: true }],
+        cancel: ['/api/control/cancel-all', { confirm: true }],
+        shutdown: ['/api/control/shutdown', { confirm: true }]
+      };
+      const [path, body] = map[action];
+      try {
+        const res = await api(path, {
+          method: 'POST',
+          body: body ? JSON.stringify(body) : undefined
+        });
+        message.textContent = res.message;
+        refresh();
+      } catch (err) {
+        message.textContent = err.message;
+      }
+    }
+
+    document.querySelectorAll('[data-action]').forEach((button) => {
+      button.addEventListener('click', () => sendAction(button.dataset.action));
+    });
+
+    document.getElementById('save-config').addEventListener('click', async () => {
+      const body = {
+        max_order_size_usdc: Number(document.getElementById('cfg-max-order').value),
+        arbitrage_execution_spread: Number(document.getElementById('cfg-spread').value),
+        stop_arbitrage_before_end_minutes: Number(document.getElementById('cfg-stop').value),
+        wind_down_before_window_end_minutes: Number(document.getElementById('cfg-wind').value),
+        min_yes_price_threshold: Number(document.getElementById('cfg-yes').value),
+        min_no_price_threshold: Number(document.getElementById('cfg-no').value)
+      };
+      try {
+        const res = await api('/api/control/config', { method: 'PATCH', body: JSON.stringify(body) });
+        message.textContent = res.message;
+        refresh();
+      } catch (err) {
+        message.textContent = err.message;
+      }
+    });
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

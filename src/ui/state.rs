@@ -217,8 +217,7 @@ impl DashboardState {
 
         let pnl_end = ((session_pnl / 4.0).clamp(2.0, 20.0)) as u64;
         s.pnl_sparkline = random_sparkline(&mut rng, SPARKLINE_LEN, pnl_end.saturating_sub(8), 1);
-        s.window_pnl_sparkline =
-            random_sparkline(&mut rng, SPARKLINE_LEN, (pnl_end / 2).max(2), 1);
+        s.window_pnl_sparkline = random_sparkline(&mut rng, SPARKLINE_LEN, (pnl_end / 2).max(2), 1);
         s.exposure_sparkline = random_sparkline(
             &mut rng,
             SPARKLINE_LEN,
@@ -297,9 +296,7 @@ impl DashboardState {
         let mut events = vec![
             format!("🚀 Session started — running for a while already"),
             format!("📡 Subscribed 8 orderbook tokens (4 markets)"),
-            format!(
-                "💰 Window PnL +${window_pnl:.2} | session +${session_pnl:.2}"
-            ),
+            format!("💰 Window PnL +${window_pnl:.2} | session +${session_pnl:.2}"),
         ];
         for _ in 0..rng.gen_range(2..5) {
             let sym = symbols[rng.gen_range(0..symbols.len())];
@@ -334,7 +331,12 @@ impl DashboardState {
 
     pub fn uptime(&self) -> String {
         let secs = self.started_at.elapsed().as_secs();
-        format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!(
+            "{:02}:{:02}:{:02}",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     }
 
     pub fn utc_now(&self) -> DateTime<Utc> {
@@ -413,13 +415,7 @@ impl DashboardState {
         }
     }
 
-    pub fn update_market(
-        &mut self,
-        symbol: &str,
-        yes: f64,
-        no: f64,
-        is_arb: bool,
-    ) {
+    pub fn update_market(&mut self, symbol: &str, yes: f64, no: f64, is_arb: bool) {
         self.ensure_market(symbol);
         if let Some(row) = self.markets.iter_mut().find(|m| m.symbol == symbol) {
             let yes_dir = PriceDir::from_delta(yes - row.yes_price);
@@ -601,6 +597,11 @@ impl DashboardHandle {
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut DashboardState) -> R) -> R {
         let mut guard = self.inner.lock().expect("dashboard lock");
         f(&mut guard)
+    }
+
+    pub fn with<R>(&self, f: impl FnOnce(&DashboardState) -> R) -> R {
+        let guard = self.inner.lock().expect("dashboard lock");
+        f(&guard)
     }
 }
 

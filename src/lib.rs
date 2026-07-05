@@ -20,4 +20,6 @@ pub use proxy_relay::{
 pub mod merge;
 pub mod positions;
 pub mod redeem;
+pub mod control;
 pub mod ui;
+pub mod web;

@@ -5,24 +5,31 @@ mod risk;
 mod trading;
 mod utils;
 
+use polypulse::control::{
+    BotCommand, CommandRequest, CommandResponse, ControlHandle, RuntimeConfig,
+};
 use polypulse::merge;
 use polypulse::positions::{get_positions, Position};
 use polypulse::ui::{decimal_to_f64, spawn_dashboard_thread, symbol_short, DashboardHandle};
+use polypulse::web::{self, WebAppState};
 
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::StreamExt;
+use polymarket_client_sdk::types::{Address, B256, U256};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::io::{stdout, IsTerminal};
+use std::net::SocketAddr;
+use std::str::FromStr as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::str::FromStr as _;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
-use polymarket_client_sdk::types::{Address, B256, U256};
 
 use crate::config::Config;
 use crate::market::{MarketDiscoverer, MarketInfo, MarketScheduler};
@@ -49,7 +56,8 @@ fn condition_ids_with_both_sides(positions: &[Position]) -> Vec<B256> {
     by_condition
         .into_iter()
         .filter(|(_, indices)| {
-            (indices.contains(&0) && indices.contains(&1)) || (indices.contains(&1) && indices.contains(&2))
+            (indices.contains(&0) && indices.contains(&1))
+                || (indices.contains(&1) && indices.contains(&2))
         })
         .map(|(c, _)| c)
         .collect()
@@ -93,6 +101,305 @@ fn raw_shares_to_decimal(raw: U256) -> Decimal {
     Decimal::from_str(&raw.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000)
 }
 
+fn runtime_config_from_config(config: &Config) -> RuntimeConfig {
+    RuntimeConfig {
+        max_order_size_usdc: config.max_order_size_usdc,
+        arbitrage_execution_spread: config.arbitrage_execution_spread,
+        stop_arbitrage_before_end_minutes: config.stop_arbitrage_before_end_minutes,
+        wind_down_before_window_end_minutes: config.wind_down_before_window_end_minutes,
+        min_yes_price_threshold: config.min_yes_price_threshold,
+        min_no_price_threshold: config.min_no_price_threshold,
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn web_bind_from_env() -> Result<SocketAddr> {
+    let bind = env::var("WEB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    bind.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid WEB_BIND value {bind:?}: {e}"))
+}
+
+fn admin_token_from_env() -> Result<String> {
+    let token = env::var("ADMIN_TOKEN")
+        .map_err(|_| anyhow::anyhow!("WEB_ENABLED=true requires ADMIN_TOKEN"))?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        Err(anyhow::anyhow!(
+            "WEB_ENABLED=true requires non-empty ADMIN_TOKEN"
+        ))
+    } else {
+        Ok(token)
+    }
+}
+
+/// Run a single Merge pass for all currently mergeable YES+NO positions.
+async fn run_merge_once(
+    label: &str,
+    proxy: Address,
+    private_key: &str,
+    position_tracker: Arc<PositionTracker>,
+    dashboard: Option<DashboardHandle>,
+) -> Result<usize> {
+    const DELAY_BETWEEN_MERGES: Duration = Duration::from_secs(30);
+    const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(12);
+
+    let positions = get_positions().await?;
+    let condition_ids = condition_ids_with_both_sides(&positions);
+    let merge_info = merge_info_with_both_sides(&positions);
+
+    if condition_ids.is_empty() {
+        debug!("{label}: no markets with both YES+NO positions");
+        if let Some(dashboard) = &dashboard {
+            dashboard.with_mut(|d| d.push_event(format!("{label}: no mergeable YES+NO positions")));
+        }
+        return Ok(0);
+    }
+
+    info!(
+        count = condition_ids.len(),
+        "{label}: {} markets have both YES+NO positions",
+        condition_ids.len()
+    );
+    if let Some(dashboard) = &dashboard {
+        dashboard.with_mut(|d| {
+            d.set_merge_status("running");
+            d.push_event(format!("{label}: merging {} markets", condition_ids.len()));
+        });
+    }
+
+    let mut merged = 0usize;
+    for (i, &condition_id) in condition_ids.iter().enumerate() {
+        if i > 0 {
+            info!(
+                "{label}: waiting 30s before merging next market ({}/{})",
+                i + 1,
+                condition_ids.len()
+            );
+            sleep(DELAY_BETWEEN_MERGES).await;
+        }
+
+        let asset_hint = merge_info
+            .get(&condition_id)
+            .map(|(yes_token, no_token, _)| (*yes_token, *no_token));
+        let mut result = merge::merge_max(condition_id, proxy, private_key, None, asset_hint).await;
+        if result.is_err() {
+            let msg = result.as_ref().unwrap_err().to_string();
+            if msg.contains("rate limit") || msg.contains("retry in") {
+                warn!(
+                    condition_id = %condition_id,
+                    "RPC rate limit, waiting {}s before retry",
+                    RATE_LIMIT_BACKOFF.as_secs()
+                );
+                sleep(RATE_LIMIT_BACKOFF).await;
+                result = merge::merge_max(condition_id, proxy, private_key, None, asset_hint).await;
+            }
+        }
+
+        match result {
+            Ok(merge_result) => {
+                merged += 1;
+                info!("{label}: Merge complete | condition_id={:#x}", condition_id);
+                info!("  tx={}", merge_result.tx_hash);
+                let chain_amt = raw_shares_to_decimal(merge_result.merged_amount);
+                if let Some((yes_token, no_token, merge_amt)) = merge_info.get(&condition_id) {
+                    let deduct = chain_amt.min(*merge_amt);
+                    position_tracker.update_exposure_cost(*yes_token, dec!(0), -deduct);
+                    position_tracker.update_exposure_cost(*no_token, dec!(0), -deduct);
+                    position_tracker.update_position(*yes_token, -deduct);
+                    position_tracker.update_position(*no_token, -deduct);
+                    info!(
+                        "{label}: Merge deducted exposure | condition_id={:#x} | amount:{} (chain:{})",
+                        condition_id, deduct, chain_amt
+                    );
+                }
+                if let Some(dashboard) = &dashboard {
+                    dashboard.with_mut(|d| {
+                        d.push_event(format!(
+                            "{label}: merged condition {:#x} tx {}",
+                            condition_id, merge_result.tx_hash
+                        ));
+                    });
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no mergeable shares") {
+                    debug!(condition_id = %condition_id, "{label}: skip merge, no mergeable shares");
+                } else {
+                    warn!(condition_id = %condition_id, error = %e, "{label}: Merge failed");
+                    if let Some(dashboard) = &dashboard {
+                        dashboard.with_mut(|d| {
+                            d.push_event(format!(
+                                "{label}: merge failed for {condition_id:#x}: {e}"
+                            ));
+                        });
+                    }
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+
+    if let Some(dashboard) = &dashboard {
+        dashboard.with_mut(|d| d.set_merge_status("idle"));
+    }
+    Ok(merged)
+}
+
+async fn run_command_processor(
+    mut receiver: mpsc::Receiver<CommandRequest>,
+    control: ControlHandle,
+    dashboard: DashboardHandle,
+    shutdown: Arc<AtomicBool>,
+    executor: Arc<TradingExecutor>,
+    config: Config,
+    position_tracker: Arc<PositionTracker>,
+    wind_down_in_progress: Arc<AtomicBool>,
+) {
+    while let Some(request) = receiver.recv().await {
+        let response = handle_command(
+            request.command,
+            control.clone(),
+            dashboard.clone(),
+            shutdown.clone(),
+            executor.clone(),
+            config.clone(),
+            position_tracker.clone(),
+            wind_down_in_progress.clone(),
+        )
+        .await;
+        let _ = request.respond_to.send(response);
+    }
+}
+
+async fn handle_command(
+    command: BotCommand,
+    control: ControlHandle,
+    dashboard: DashboardHandle,
+    shutdown: Arc<AtomicBool>,
+    executor: Arc<TradingExecutor>,
+    config: Config,
+    position_tracker: Arc<PositionTracker>,
+    wind_down_in_progress: Arc<AtomicBool>,
+) -> CommandResponse {
+    if !command.is_confirmed() {
+        return CommandResponse::rejected(format!("{} requires confirm=true", command.name()));
+    }
+
+    match command {
+        BotCommand::PauseTrading => {
+            control.set_trading_paused(true, "trading paused from web console");
+            dashboard.with_mut(|d| d.push_event("Trading paused from web console"));
+            CommandResponse::accepted("trading paused")
+        }
+        BotCommand::ResumeTrading => {
+            control.set_trading_paused(false, "trading resumed from web console");
+            dashboard.with_mut(|d| d.push_event("Trading resumed from web console"));
+            CommandResponse::accepted("trading resumed")
+        }
+        BotCommand::UpdateRuntimeConfig { patch } => {
+            match control.update_runtime_config(&patch, "runtime config updated from web console") {
+                Ok(_) => {
+                    dashboard.with_mut(|d| d.push_event("Runtime config updated from web console"));
+                    CommandResponse::accepted("runtime config updated")
+                }
+                Err(e) => CommandResponse::rejected(e),
+            }
+        }
+        BotCommand::RunMergeNow { .. } => {
+            if wind_down_in_progress.load(Ordering::Relaxed) {
+                return CommandResponse::rejected(
+                    "wind-down is in progress; merge command rejected",
+                );
+            }
+            if control.snapshot().merge_running {
+                return CommandResponse::rejected("merge is already running");
+            }
+            let Some(proxy) = config.proxy_address else {
+                return CommandResponse::rejected("POLYMARKET_PROXY_ADDRESS is required for merge");
+            };
+
+            control.set_merge_running(true);
+            control.record_command("manual merge started from web console");
+            dashboard.with_mut(|d| d.push_event("Manual merge started from web console"));
+
+            let control_done = control.clone();
+            let dashboard_done = dashboard.clone();
+            let private_key = config.private_key.clone();
+            tokio::spawn(async move {
+                let result = run_merge_once(
+                    "Manual merge",
+                    proxy,
+                    &private_key,
+                    position_tracker,
+                    Some(dashboard_done.clone()),
+                )
+                .await;
+                match result {
+                    Ok(count) => {
+                        control_done
+                            .record_command(format!("manual merge finished: {count} markets"));
+                        dashboard_done.with_mut(|d| {
+                            d.push_event(format!("Manual merge finished: {count} markets"));
+                        });
+                    }
+                    Err(e) => {
+                        control_done.record_error(format!("manual merge failed: {e}"));
+                        dashboard_done.with_mut(|d| {
+                            d.push_event(format!("Manual merge failed: {e}"));
+                            d.set_merge_status("error");
+                        });
+                    }
+                }
+                control_done.set_merge_running(false);
+            });
+
+            CommandResponse::accepted("manual merge started")
+        }
+        BotCommand::CancelAllOrders { .. } => {
+            if control.snapshot().cancel_running {
+                return CommandResponse::rejected("cancel-all is already running");
+            }
+            control.set_cancel_running(true);
+            control.record_command("cancel all orders started from web console");
+            dashboard.with_mut(|d| d.push_event("Cancel all orders started from web console"));
+
+            let control_done = control.clone();
+            let dashboard_done = dashboard.clone();
+            tokio::spawn(async move {
+                match executor.cancel_all_orders().await {
+                    Ok(_) => {
+                        control_done.record_command("cancel all orders finished");
+                        dashboard_done.with_mut(|d| d.push_event("Cancel all orders finished"));
+                    }
+                    Err(e) => {
+                        control_done.record_error(format!("cancel all orders failed: {e}"));
+                        dashboard_done
+                            .with_mut(|d| d.push_event(format!("Cancel all orders failed: {e}")));
+                    }
+                }
+                control_done.set_cancel_running(false);
+            });
+
+            CommandResponse::accepted("cancel all orders started")
+        }
+        BotCommand::Shutdown { .. } => {
+            control.request_shutdown("shutdown requested from web console");
+            dashboard.with_mut(|d| d.push_event("Shutdown requested from web console"));
+            shutdown.store(true, Ordering::Relaxed);
+            CommandResponse::accepted("shutdown requested")
+        }
+    }
+}
+
 /// Scheduled Merge task: every interval_minutes minutes fetch **positions**, run merge_max **serially** only for markets with both YES+NO positions,
 /// skip one-sided positions; delay between each merge, retry once on RPC rate limit. After merge success, deduct position_tracker holdings and exposure.
 /// Brief initial delay before first run to avoid blocking the orderbook stream by competing for runtime at startup.
@@ -102,12 +409,10 @@ async fn run_merge_task(
     private_key: String,
     position_tracker: Arc<PositionTracker>,
     wind_down_in_progress: Arc<AtomicBool>,
+    control: ControlHandle,
+    dashboard: DashboardHandle,
 ) {
     let interval = Duration::from_secs(interval_minutes * 60);
-    /// Delay between each merge to reduce RPC bursts
-    const DELAY_BETWEEN_MERGES: Duration = Duration::from_secs(30);
-    /// Duration to wait before retry on rate limit (slightly longer than "retry in 10s")
-    const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(12);
     /// Initial delay so main loop can finish orderbook subscription and enter select! before first merge
     const INITIAL_DELAY: Duration = Duration::from_secs(10);
 
@@ -120,76 +425,32 @@ async fn run_merge_task(
             sleep(interval).await;
             continue;
         }
-        let (condition_ids, merge_info) = match get_positions().await {
-            Ok(positions) => (
-                condition_ids_with_both_sides(&positions),
-                merge_info_with_both_sides(&positions),
-            ),
+
+        if control.snapshot().merge_running {
+            info!("Another merge is already running, skipping scheduled merge round");
+            sleep(interval).await;
+            continue;
+        }
+
+        control.set_merge_running(true);
+        match run_merge_once(
+            "Scheduled merge",
+            proxy,
+            &private_key,
+            position_tracker.clone(),
+            Some(dashboard.clone()),
+        )
+        .await
+        {
+            Ok(count) => {
+                control.record_command(format!("scheduled merge finished: {count} markets"))
+            }
             Err(e) => {
-                warn!(error = %e, "❌ Failed to fetch positions, skipping merge for this round");
-                sleep(interval).await;
-                continue;
+                warn!(error = %e, "Failed to run scheduled merge");
+                control.record_error(format!("scheduled merge failed: {e}"));
             }
-        };
-
-        if condition_ids.is_empty() {
-            debug!("🔄 Merge round: no markets with both YES+NO positions");
-        } else {
-            info!(
-                count = condition_ids.len(),
-                "🔄 Merge round: {} markets have both YES+NO positions",
-                condition_ids.len()
-            );
         }
-
-        for (i, &condition_id) in condition_ids.iter().enumerate() {
-            // For 2nd and later markets: wait 30s before merge to avoid overlap with previous on-chain tx
-            if i > 0 {
-                info!("Merge round: waiting 30s before merging next market ({}/{})", i + 1, condition_ids.len());
-                sleep(DELAY_BETWEEN_MERGES).await;
-            }
-            let asset_hint = merge_info
-                .get(&condition_id)
-                .map(|(yes_token, no_token, _)| (*yes_token, *no_token));
-            let mut result =
-                merge::merge_max(condition_id, proxy, &private_key, None, asset_hint).await;
-            if result.is_err() {
-                let msg = result.as_ref().unwrap_err().to_string();
-                if msg.contains("rate limit") || msg.contains("retry in") {
-                    warn!(condition_id = %condition_id, "⏳ RPC rate limit, waiting {}s before retry", RATE_LIMIT_BACKOFF.as_secs());
-                    sleep(RATE_LIMIT_BACKOFF).await;
-                    result = merge::merge_max(condition_id, proxy, &private_key, None, asset_hint).await;
-                }
-            }
-            match result {
-                Ok(merge_result) => {
-                    info!("✅ Merge complete | condition_id={:#x}", condition_id);
-                    info!("  📝 tx={}", merge_result.tx_hash);
-                    let chain_amt = raw_shares_to_decimal(merge_result.merged_amount);
-                    if let Some((yes_token, no_token, merge_amt)) = merge_info.get(&condition_id) {
-                        let deduct = chain_amt.min(*merge_amt);
-                        position_tracker.update_exposure_cost(*yes_token, dec!(0), -deduct);
-                        position_tracker.update_exposure_cost(*no_token, dec!(0), -deduct);
-                        position_tracker.update_position(*yes_token, -deduct);
-                        position_tracker.update_position(*no_token, -deduct);
-                        info!(
-                            "💰 Merge deducted exposure | condition_id={:#x} | amount:{} (chain:{})",
-                            condition_id, deduct, chain_amt
-                        );
-                    }
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("no mergeable shares") {
-                        debug!(condition_id = %condition_id, "⏭️ Skip merge: no mergeable shares");
-                    } else {
-                        warn!(condition_id = %condition_id, error = %e, "❌ Merge failed");
-                    }
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-
+        control.set_merge_running(false);
         sleep(interval).await;
     }
 }
@@ -208,17 +469,32 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     if use_tui {
-        tracing::info!("Polymarket 5-minute arbitrage bot starting (dashboard mode, logs → bot.log)");
+        tracing::info!(
+            "Polymarket 5-minute arbitrage bot starting (dashboard mode, logs → bot.log)"
+        );
     } else {
         tracing::info!("Polymarket 5-minute arbitrage bot starting");
     }
 
     // Load config
     let config = Config::from_env()?;
+    let web_enabled = env_flag("WEB_ENABLED");
+    let web_bind = if web_enabled {
+        Some(web_bind_from_env()?)
+    } else {
+        None
+    };
+    let admin_token = if web_enabled {
+        Some(admin_token_from_env()?)
+    } else {
+        None
+    };
     tracing::info!("Config loaded");
 
     let order_mode = format!("{:?}", config.arbitrage_order_type);
     let dashboard = DashboardHandle::new_live(order_mode, config.risk_max_exposure_usdc);
+    let control = ControlHandle::new(runtime_config_from_config(&config));
+    let (command_tx, command_rx) = mpsc::channel::<CommandRequest>(32);
     if use_tui {
         spawn_dashboard_thread(dashboard.arc(), shutdown.clone());
         dashboard.with_mut(|d| {
@@ -230,12 +506,12 @@ async fn main() -> Result<()> {
     let _discoverer = MarketDiscoverer::new(config.crypto_symbols.clone());
     let _scheduler = MarketScheduler::new(_discoverer, config.market_refresh_advance_secs);
     let _detector = ArbitrageDetector::new(config.min_profit_threshold);
-    
+
     // Validate private key format
     info!("Verifying private key format...");
     use alloy::signers::local::LocalSigner;
     use std::str::FromStr;
-    
+
     let _signer_test = LocalSigner::from_str(&config.private_key)
         .map_err(|e| anyhow::anyhow!("Invalid private key format: {}", e))?;
     info!("Private key format validated");
@@ -291,7 +567,7 @@ async fn main() -> Result<()> {
     ));
 
     let _risk_manager = Arc::new(RiskManager::new(clob_client.clone(), &config));
-    
+
     // Create hedge monitor (pass PositionTracker Arc for exposure updates)
     // Hedge strategy is currently disabled but hedge_monitor kept for future use
     let position_tracker = _risk_manager.position_tracker();
@@ -363,8 +639,7 @@ async fn main() -> Result<()> {
     if balance_interval > 0 {
         info!(
             interval_secs = balance_interval,
-            "Position balance task runs in main loop every {}s",
-            balance_interval
+            "Position balance task runs in main loop every {}s", balance_interval
         );
     } else {
         info!("Position balance not enabled (POSITION_BALANCE_INTERVAL_SECS=0)");
@@ -373,9 +648,39 @@ async fn main() -> Result<()> {
     // Wind-down in progress flag: scheduled merge checks and skips to avoid race with wind-down merge
     let wind_down_in_progress = Arc::new(AtomicBool::new(false));
 
+    tokio::spawn(run_command_processor(
+        command_rx,
+        control.clone(),
+        dashboard.clone(),
+        shutdown.clone(),
+        executor.clone(),
+        config.clone(),
+        _risk_manager.position_tracker().clone(),
+        wind_down_in_progress.clone(),
+    ));
+
+    if let (Some(bind), Some(admin_token)) = (web_bind, admin_token) {
+        let web_state = WebAppState::new(
+            dashboard.clone(),
+            control.clone(),
+            command_tx.clone(),
+            admin_token,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = web::serve(bind, web_state).await {
+                error!(error = %e, "Web control console stopped");
+            }
+        });
+        info!(bind = %bind, "Web control console enabled");
+        dashboard.with_mut(|d| d.push_event(format!("Web control console listening on {bind}")));
+    } else {
+        info!("Web control console disabled (WEB_ENABLED=false)");
+    }
+
     // Minimum interval between two arbitrage trades
     const MIN_TRADE_INTERVAL: Duration = Duration::from_secs(3);
-    let last_trade_time: Arc<tokio::sync::Mutex<Option<Instant>>> = Arc::new(tokio::sync::Mutex::new(None));
+    let last_trade_time: Arc<tokio::sync::Mutex<Option<Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
 
     // Scheduled Merge: every N minutes run merge by positions, only for markets with both YES+NO
     let merge_interval = config.merge_interval_minutes;
@@ -384,8 +689,19 @@ async fn main() -> Result<()> {
             let private_key = config.private_key.clone();
             let position_tracker = _risk_manager.position_tracker().clone();
             let wind_down_flag = wind_down_in_progress.clone();
+            let control_merge = control.clone();
+            let dashboard_merge = dashboard.clone();
             tokio::spawn(async move {
-                run_merge_task(merge_interval, proxy, private_key, position_tracker, wind_down_flag).await;
+                run_merge_task(
+                    merge_interval,
+                    proxy,
+                    private_key,
+                    position_tracker,
+                    wind_down_flag,
+                    control_merge,
+                    dashboard_merge,
+                )
+                .await;
             });
             info!(
                 interval_minutes = merge_interval,
@@ -454,30 +770,41 @@ async fn main() -> Result<()> {
 
         let window_label = markets
             .first()
-            .map(|m| format!("{}-updown-5m", symbol_short(&m.crypto_symbol).to_lowercase()))
+            .map(|m| {
+                format!(
+                    "{}-updown-5m",
+                    symbol_short(&m.crypto_symbol).to_lowercase()
+                )
+            })
             .unwrap_or_else(|| "updown-5m".to_string());
 
         dashboard.with_mut(|d| {
             d.set_window(&window_label, 300);
             d.set_connected(true);
-            d.push_event(format!("📡 Live — {} markets in {}", markets.len(), window_label));
+            d.push_event(format!(
+                "📡 Live — {} markets in {}",
+                markets.len(),
+                window_label
+            ));
         });
 
         // Record current window timestamp for cycle switch and wind-down detection
-        use chrono::Utc;
         use crate::market::discoverer::FIVE_MIN_SECS;
-        let current_window_timestamp = MarketDiscoverer::calculate_current_window_timestamp(Utc::now());
-        let window_end = chrono::DateTime::from_timestamp(current_window_timestamp + FIVE_MIN_SECS, 0)
-            .unwrap_or_else(|| Utc::now());
+        use chrono::Utc;
+        let current_window_timestamp =
+            MarketDiscoverer::calculate_current_window_timestamp(Utc::now());
+        let window_end =
+            chrono::DateTime::from_timestamp(current_window_timestamp + FIVE_MIN_SECS, 0)
+                .unwrap_or_else(|| Utc::now());
         let mut wind_down_done = false;
 
         // Create market_id -> market info mapping
-        let market_map: HashMap<B256, &MarketInfo> = markets.iter()
-            .map(|m| (m.market_id, m))
-            .collect();
+        let market_map: HashMap<B256, &MarketInfo> =
+            markets.iter().map(|m| (m.market_id, m)).collect();
 
         // Create market mapping (condition_id -> (yes_token_id, no_token_id)) for position balance
-        let market_token_map: HashMap<B256, (U256, U256)> = markets.iter()
+        let market_token_map: HashMap<B256, (U256, U256)> = markets
+            .iter()
             .map(|m| (m.market_id, (m.yes_token_id, m.no_token_id)))
             .collect();
 
@@ -499,12 +826,17 @@ async fn main() -> Result<()> {
         loop {
             // Wind-down check: run once when <= N minutes to window end (stay in loop until natural switch by new-window detection)
             // Use second precision; num_minutes() truncation may miss in 5min windows
-            if config.wind_down_before_window_end_minutes > 0 && !wind_down_done {
+            let runtime_config = control.runtime_config();
+            if runtime_config.wind_down_before_window_end_minutes > 0 && !wind_down_done {
                 let now = Utc::now();
                 let seconds_until_end = (window_end - now).num_seconds();
-                let threshold_seconds = config.wind_down_before_window_end_minutes as i64 * 60;
+                let threshold_seconds =
+                    runtime_config.wind_down_before_window_end_minutes as i64 * 60;
                 if seconds_until_end <= threshold_seconds {
-                    info!("🛑 Wind-down triggered | {}s until window end", seconds_until_end);
+                    info!(
+                        "🛑 Wind-down triggered | {}s until window end",
+                        seconds_until_end
+                    );
                     wind_down_done = true;
                     wind_down_in_progress.store(true, Ordering::Relaxed);
 
@@ -513,21 +845,29 @@ async fn main() -> Result<()> {
                     let config_wd = config.clone();
                     let risk_manager_wd = _risk_manager.clone();
                     let wind_down_flag = wind_down_in_progress.clone();
+                    let control_wd = control.clone();
+                    let dashboard_wd = dashboard.clone();
                     tokio::spawn(async move {
                         const MERGE_INTERVAL: Duration = Duration::from_secs(30);
 
                         // 1. Cancel all orders
+                        control_wd.set_cancel_running(true);
                         if let Err(e) = executor_wd.cancel_all_orders().await {
                             warn!(error = %e, "Wind-down: failed to cancel all orders, continuing with Merge and sell");
+                            control_wd.record_error(format!("wind-down cancel failed: {e}"));
                         } else {
                             info!("✅ Wind-down: all orders cancelled");
+                            dashboard_wd
+                                .with_mut(|d| d.push_event("Wind-down: all orders cancelled"));
                         }
+                        control_wd.set_cancel_running(false);
 
                         // Wait 10s after cancel before Merge so recent fills can settle on-chain
                         const DELAY_AFTER_CANCEL: Duration = Duration::from_secs(10);
                         sleep(DELAY_AFTER_CANCEL).await;
 
                         // 2. Merge both sides (30s between markets) and update exposure
+                        control_wd.set_merge_running(true);
                         let position_tracker = risk_manager_wd.position_tracker();
                         let mut did_any_merge = false;
                         if let Some(proxy) = config_wd.proxy_address {
@@ -537,9 +877,9 @@ async fn main() -> Result<()> {
                                     let merge_info = merge_info_with_both_sides(&positions);
                                     let n = condition_ids.len();
                                     for (i, condition_id) in condition_ids.iter().enumerate() {
-                                        let asset_hint = merge_info
-                                            .get(condition_id)
-                                            .map(|(yes_token, no_token, _)| (*yes_token, *no_token));
+                                        let asset_hint = merge_info.get(condition_id).map(
+                                            |(yes_token, no_token, _)| (*yes_token, *no_token),
+                                        );
                                         match merge::merge_max(
                                             *condition_id,
                                             proxy,
@@ -547,28 +887,52 @@ async fn main() -> Result<()> {
                                             None,
                                             asset_hint,
                                         )
-                                        .await {
+                                        .await
+                                        {
                                             Ok(merge_result) => {
                                                 did_any_merge = true;
                                                 info!(
                                                     "✅ Wind-down: Merge done | condition_id={:#x} | tx={}",
                                                     condition_id, merge_result.tx_hash
                                                 );
-                                                let chain_amt = raw_shares_to_decimal(merge_result.merged_amount);
-                                                if let Some((yes_token, no_token, merge_amt)) = merge_info.get(condition_id) {
+                                                let chain_amt = raw_shares_to_decimal(
+                                                    merge_result.merged_amount,
+                                                );
+                                                if let Some((yes_token, no_token, merge_amt)) =
+                                                    merge_info.get(condition_id)
+                                                {
                                                     let deduct = chain_amt.min(*merge_amt);
-                                                    position_tracker.update_exposure_cost(*yes_token, dec!(0), -deduct);
-                                                    position_tracker.update_exposure_cost(*no_token, dec!(0), -deduct);
-                                                    position_tracker.update_position(*yes_token, -deduct);
-                                                    position_tracker.update_position(*no_token, -deduct);
+                                                    position_tracker.update_exposure_cost(
+                                                        *yes_token,
+                                                        dec!(0),
+                                                        -deduct,
+                                                    );
+                                                    position_tracker.update_exposure_cost(
+                                                        *no_token,
+                                                        dec!(0),
+                                                        -deduct,
+                                                    );
+                                                    position_tracker
+                                                        .update_position(*yes_token, -deduct);
+                                                    position_tracker
+                                                        .update_position(*no_token, -deduct);
                                                     info!(
                                                         "💰 Wind-down: Merge deducted exposure | condition_id={:#x} | amount:{} (chain:{})",
                                                         condition_id, deduct, chain_amt
                                                     );
                                                 }
+                                                dashboard_wd.with_mut(|d| {
+                                                    d.push_event(format!(
+                                                        "Wind-down: merged {condition_id:#x} tx {}",
+                                                        merge_result.tx_hash
+                                                    ));
+                                                });
                                             }
                                             Err(e) => {
                                                 warn!(condition_id = %condition_id, error = %e, "Wind-down: Merge failed");
+                                                control_wd.record_error(format!(
+                                                    "wind-down merge failed: {e}"
+                                                ));
                                             }
                                         }
                                         // Wait 30s after each market merge before next, for on-chain settlement
@@ -578,11 +942,14 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
-                                Err(e) => { warn!(error = %e, "Wind-down: failed to get positions, skipping Merge"); }
+                                Err(e) => {
+                                    warn!(error = %e, "Wind-down: failed to get positions, skipping Merge");
+                                }
                             }
                         } else {
                             warn!("Wind-down: POLYMARKET_PROXY_ADDRESS not set, skipping Merge");
                         }
+                        control_wd.set_merge_running(false);
 
                         // If merge ran, wait 30s before selling one-sided legs for on-chain; else no wait
                         if did_any_merge {
@@ -590,7 +957,8 @@ async fn main() -> Result<()> {
                         }
 
                         // 3. Market-sell remaining one-sided positions
-                        let wind_down_sell_price = Decimal::try_from(config_wd.wind_down_sell_price).unwrap_or(dec!(0.01));
+                        let wind_down_sell_price =
+                            Decimal::try_from(config_wd.wind_down_sell_price).unwrap_or(dec!(0.01));
                         match get_positions().await {
                             Ok(positions) => {
                                 for pos in positions.iter().filter(|p| p.size > dec!(0)) {
@@ -599,17 +967,24 @@ async fn main() -> Result<()> {
                                         debug!(token_id = %pos.asset, size = %pos.size, "Wind-down: position too small, skip sell");
                                         continue;
                                     }
-                                    if let Err(e) = executor_wd.sell_at_price(pos.asset, wind_down_sell_price, size_floor).await {
+                                    if let Err(e) = executor_wd
+                                        .sell_at_price(pos.asset, wind_down_sell_price, size_floor)
+                                        .await
+                                    {
                                         warn!(token_id = %pos.asset, size = %pos.size, error = %e, "Wind-down: failed to sell one-sided leg");
                                     } else {
                                         info!("✅ Wind-down: sell order placed | token_id={:#x} | amount:{} | price:{:.4}", pos.asset, size_floor, wind_down_sell_price);
                                     }
                                 }
                             }
-                            Err(e) => { warn!(error = %e, "Wind-down: failed to get positions, skipping sell"); }
+                            Err(e) => {
+                                warn!(error = %e, "Wind-down: failed to get positions, skipping sell");
+                            }
                         }
 
                         info!("🛑 Wind-down complete, continuing to monitor until window end");
+                        control_wd.record_command("wind-down complete");
+                        dashboard_wd.with_mut(|d| d.push_event("Wind-down complete"));
                         wind_down_flag.store(false, Ordering::Relaxed);
                     });
                 }
@@ -685,22 +1060,21 @@ async fn main() -> Result<()> {
                                     })
                                     .unwrap_or_else(|| "No:none".to_string());
 
-                                if use_tui {
-                                    if let (Some((yp, _)), Some((np, _))) = (yes_best_ask, no_best_ask) {
-                                        let sym = symbol_short(market_symbol);
-                                        let is_arb = total_ask_price
-                                            .map(|t| t < dec!(1.0))
-                                            .unwrap_or(false);
-                                        dashboard.with_mut(|d| {
-                                            d.update_market(
-                                                &sym,
-                                                decimal_to_f64(yp),
-                                                decimal_to_f64(np),
-                                                is_arb,
-                                            );
-                                        });
-                                    }
-                                } else {
+                                if let (Some((yp, _)), Some((np, _))) = (yes_best_ask, no_best_ask) {
+                                    let sym = symbol_short(market_symbol);
+                                    let is_arb = total_ask_price
+                                        .map(|t| t < dec!(1.0))
+                                        .unwrap_or(false);
+                                    dashboard.with_mut(|d| {
+                                        d.update_market(
+                                            &sym,
+                                            decimal_to_f64(yp),
+                                            decimal_to_f64(np),
+                                            is_arb,
+                                        );
+                                    });
+                                }
+                                if !use_tui {
                                     info!(
                                         "{} {} | {} | {} | {}",
                                         prefix,
@@ -721,7 +1095,8 @@ async fn main() -> Result<()> {
 
                                 // Detect arbitrage (monitoring: execute only when total <= 1 - execution spread)
                                 use rust_decimal::Decimal;
-                                let execution_threshold = dec!(1.0) - Decimal::try_from(config.arbitrage_execution_spread)
+                                let runtime_config = control.runtime_config();
+                                let execution_threshold = dec!(1.0) - Decimal::try_from(runtime_config.arbitrage_execution_spread)
                                     .unwrap_or(dec!(0.01));
                                 if let Some(total_price) = total_ask_price {
                                     if total_price <= execution_threshold {
@@ -730,73 +1105,93 @@ async fn main() -> Result<()> {
                                             &pair.no_book,
                                             &pair.market_id,
                                         ) {
+                                            if control.trading_paused() {
+                                                debug!(
+                                                    "Trading paused, skip arbitrage | market:{}",
+                                                    market_display
+                                                );
+                                                continue;
+                                            }
+
                                             // Check YES price threshold
-                                            if config.min_yes_price_threshold > 0.0 {
+                                            if runtime_config.min_yes_price_threshold > 0.0 {
                                                 use rust_decimal::Decimal;
-                                                let min_yes_price_decimal = Decimal::try_from(config.min_yes_price_threshold)
+                                                let min_yes_price_decimal =
+                                                    Decimal::try_from(
+                                                        runtime_config.min_yes_price_threshold,
+                                                    )
                                                     .unwrap_or(dec!(0.0));
                                                 if opp.yes_ask_price < min_yes_price_decimal {
                                                     debug!(
                                                         "⏸️ YES price below threshold, skip arbitrage | market:{} | YES:{:.4} | threshold:{:.4}",
                                                         market_display,
                                                         opp.yes_ask_price,
-                                                        config.min_yes_price_threshold
+                                                        runtime_config.min_yes_price_threshold
                                                     );
                                                     continue; // Skip this arbitrage
                                                 }
                                             }
-                                            
+
                                             // Check NO price threshold
-                                            if config.min_no_price_threshold > 0.0 {
+                                            if runtime_config.min_no_price_threshold > 0.0 {
                                                 use rust_decimal::Decimal;
-                                                let min_no_price_decimal = Decimal::try_from(config.min_no_price_threshold)
+                                                let min_no_price_decimal =
+                                                    Decimal::try_from(
+                                                        runtime_config.min_no_price_threshold,
+                                                    )
                                                     .unwrap_or(dec!(0.0));
                                                 if opp.no_ask_price < min_no_price_decimal {
                                                     debug!(
                                                         "⏸️ NO price below threshold, skip arbitrage | market:{} | NO:{:.4} | threshold:{:.4}",
                                                         market_display,
                                                         opp.no_ask_price,
-                                                        config.min_no_price_threshold
+                                                        runtime_config.min_no_price_threshold
                                                     );
                                                     continue; // Skip this arbitrage
                                                 }
                                             }
-                                            
+
                                             // Check if near market end (if stop time configured)
                                             // Second precision; num_minutes() may miss in 5min markets
-                                            if config.stop_arbitrage_before_end_minutes > 0 {
+                                            if runtime_config.stop_arbitrage_before_end_minutes > 0 {
                                                 if let Some(market_info) = market_map.get(&pair.market_id) {
                                                     use chrono::Utc;
                                                     let now = Utc::now();
-                                                    let time_until_end = market_info.end_date.signed_duration_since(now);
+                                                    let time_until_end =
+                                                        market_info.end_date.signed_duration_since(now);
                                                     let seconds_until_end = time_until_end.num_seconds();
-                                                    let threshold_seconds = config.stop_arbitrage_before_end_minutes as i64 * 60;
-                                                    
+                                                    let threshold_seconds =
+                                                        runtime_config.stop_arbitrage_before_end_minutes
+                                                            as i64
+                                                            * 60;
+
                                                     if seconds_until_end <= threshold_seconds {
                                                         debug!(
                                                             "⏰ Near market end, skip arbitrage | market:{} | seconds to end:{} | stop threshold:{}min",
                                                             market_display,
                                                             seconds_until_end,
-                                                            config.stop_arbitrage_before_end_minutes
+                                                            runtime_config.stop_arbitrage_before_end_minutes
                                                         );
                                                         continue; // Skip this arbitrage
                                                     }
                                                 }
                                             }
-                                            
+
                                             // Calculate order cost (USD)
                                             // Use actual available size from arb, but cap at max order size
                                             use rust_decimal::Decimal;
-                                            let max_order_size = Decimal::try_from(config.max_order_size_usdc).unwrap_or(dec!(100.0));
+                                            let max_order_size =
+                                                Decimal::try_from(runtime_config.max_order_size_usdc)
+                                                    .unwrap_or(dec!(100.0));
                                             let order_size = opp.yes_size.min(opp.no_size).min(max_order_size);
                                             let yes_cost = opp.yes_ask_price * order_size;
                                             let no_cost = opp.no_ask_price * order_size;
                                             let total_cost = yes_cost + no_cost;
-                                            
+
                                             // Check risk exposure limit
                                             let position_tracker = _risk_manager.position_tracker();
                                             let current_exposure = position_tracker.calculate_exposure();
-                                            
+
                                             if position_tracker.would_exceed_limit(yes_cost, no_cost) {
                                                 warn!(
                                                     "�� ️ Risk exposure limit exceeded, skip arbitrage | market:{} | exposure:{:.2} USD | order cost:{:.2} USD | limit:{:.2} USD",
@@ -807,7 +1202,7 @@ async fn main() -> Result<()> {
                                                 );
                                                 continue; // Skip this arbitrage
                                             }
-                                            
+
                                             // Check position balance (local cache, zero latency)
                                             if position_balancer.should_skip_arbitrage(opp.yes_token_id, opp.no_token_id) {
                                                 warn!(
@@ -816,7 +1211,7 @@ async fn main() -> Result<()> {
                                                 );
                                                 continue; // Skip this arbitrage
                                             }
-                                            
+
                                             // Check trade interval: min 3s between trades
                                             {
                                                 let mut guard = last_trade_time.lock().await;
@@ -840,17 +1235,16 @@ async fn main() -> Result<()> {
                                                 (dec!(1.0) - opp.yes_ask_price - opp.no_ask_price)
                                                     * order_size,
                                             );
-                                            if use_tui {
-                                                dashboard.with_mut(|d| {
-                                                    d.set_exposure(decimal_to_f64(current_exposure));
-                                                    d.record_trade_attempt(
-                                                        &trade_sym,
-                                                        decimal_to_f64(opp.profit_percentage),
-                                                        decimal_to_f64(order_size),
-                                                        decimal_to_f64(total_cost),
-                                                    );
-                                                });
-                                            } else {
+                                            dashboard.with_mut(|d| {
+                                                d.set_exposure(decimal_to_f64(current_exposure));
+                                                d.record_trade_attempt(
+                                                    &trade_sym,
+                                                    decimal_to_f64(opp.profit_percentage),
+                                                    decimal_to_f64(order_size),
+                                                    decimal_to_f64(total_cost),
+                                                );
+                                            });
+                                            if !use_tui {
                                                 info!(
                                                     "⚡ Execute arbitrage | market:{} | profit:{:.2}% | size:{} | cost:{:.2} USD | exposure:{:.2} USD",
                                                     market_display,
@@ -864,7 +1258,7 @@ async fn main() -> Result<()> {
                                             let _pt = _risk_manager.position_tracker();
                                             _pt.update_exposure_cost(opp.yes_token_id, opp.yes_ask_price, order_size);
                                             _pt.update_exposure_cost(opp.no_token_id, opp.no_ask_price, order_size);
-                                            
+
                                             // Arb execution: run whenever total <= threshold, direction only for slippage (down=second, up/flat=first)
                                             // Clone vars for spawned task (direction used for slippage allocation)
                                             let executor_clone = executor.clone();
@@ -874,11 +1268,20 @@ async fn main() -> Result<()> {
                                             let no_dir_s = no_dir.to_string();
                                             let dashboard_trade = dashboard.clone();
                                             let trade_sym_spawn = trade_sym.clone();
+                                            let runtime_max_order_size = max_order_size;
 
                                             // Spawn async to avoid blocking orderbook updates
                                             tokio::spawn(async move {
                                                 // Execute arbitrage (slippage: down=second, up/flat=first)
-                                                match executor_clone.execute_arbitrage_pair(&opp_clone, &yes_dir_s, &no_dir_s).await {
+                                                match executor_clone
+                                                    .execute_arbitrage_pair_with_max_order_size(
+                                                        &opp_clone,
+                                                        &yes_dir_s,
+                                                        &no_dir_s,
+                                                        runtime_max_order_size,
+                                                    )
+                                                    .await
+                                                {
                                                     Ok(result) => {
                                                         if result.success {
                                                             dashboard_trade.with_mut(|d| {
@@ -899,7 +1302,7 @@ async fn main() -> Result<()> {
 
                                                         // Save pair_id first, result will be moved
                                                         let pair_id = result.pair_id.clone();
-                                                        
+
                                                         // Register with risk manager (with prices for exposure calc)
                                                         risk_manager_clone.register_order_pair(
                                                             result,
@@ -1019,4 +1422,3 @@ async fn main() -> Result<()> {
         info!("Current window monitoring ended, refreshing markets for next round");
     }
 }
-

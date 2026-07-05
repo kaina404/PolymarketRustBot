@@ -13,7 +13,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/polypulse /app/polypulse
-# 后台套利 worker:不监听端口,故无 EXPOSE
+# Web 控制台启用时监听 WEB_BIND，默认 0.0.0.0:8080；请在外层反代终止 HTTPS
+EXPOSE 8080
 # 容器无 TTY,程序自动走纯日志模式(见 src/main.rs 的 is_terminal 判断)
-# 私钥 / Builder API 等敏感配置由 zeabur 环境变量运行时注入,不打进镜像
+# 私钥 / Builder API / ADMIN_TOKEN 等敏感配置由运行时环境变量注入,不打进镜像
 CMD ["/app/polypulse"]

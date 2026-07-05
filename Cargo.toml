@@ -8,6 +8,7 @@ default-run = "polypulse"
 polymarket-client-sdk = { version = "0.4.1", features = ["clob", "ctf", "data", "gamma", "ws", "tracing"] }
 polymarket-client-sdk-v2 = { package = "polymarket_client_sdk_v2", version = "0.6.0-canary.1", features = ["clob"] }
 tokio = { version = "1.49", features = ["full"] }
+axum = "0.8"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

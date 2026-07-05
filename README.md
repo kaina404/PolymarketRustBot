@@ -95,9 +95,26 @@ Get these from Polymarket → Settings → Builder.
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | Max exposure per round |
 | `MERGE_INTERVAL_MINUTES` | `0` | Scheduled Merge interval (minutes); `0` = disabled |
 | `WIND_DOWN_BEFORE_WINDOW_END_MINUTES` | `0` | Wind-down before window end (minutes); `0` = disabled |
+| `WEB_ENABLED` | `false` | Enable the embedded web control console |
+| `WEB_BIND` | `0.0.0.0:8080` | Web control console bind address |
+| `ADMIN_TOKEN` | none | Web control console Bearer token, required when enabled |
 | `RUST_LOG` | `info` | Log level |
 
 Other settings (CLOB URL, signature type, slippage, order type, position sync, etc.) have sensible defaults. See `.env.example` for the full list with bilingual comments.
+
+### Web control console
+
+When enabled, the Rust process runs both the trading bot and an embedded web console. The console supports status monitoring, pause/resume trading, manual Merge, cancel all orders, graceful shutdown, and editing whitelisted runtime parameters.
+
+Recommended remote Docker settings:
+
+```bash
+WEB_ENABLED=true
+WEB_BIND=0.0.0.0:8080
+ADMIN_TOKEN=a-long-random-secret-token
+```
+
+Expose it only through a fixed domain with HTTPS termination at your reverse proxy. Every API request requires `Authorization: Bearer <ADMIN_TOKEN>`; manual Merge, cancel-all, and shutdown also require backend `confirm=true`. The console does not expose or edit private keys, proxy addresses, Builder credentials, or the CLOB URL.
 
 ## Disclaimer
 
