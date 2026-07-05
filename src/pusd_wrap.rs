@@ -79,6 +79,7 @@ async fn safe_exec_call<P: Provider>(
     signer: &impl alloy::signers::Signer,
     to: Address,
     calldata: Vec<u8>,
+    inner_gas_limit: Option<u64>,
 ) -> Result<alloy::primitives::B256> {
     use alloy::primitives::keccak256;
     let nonce: U256 = safe
@@ -113,12 +114,13 @@ async fn safe_exec_call<P: Provider>(
         sig_bytes[64] += 27;
     }
     let (max_fee, max_prio) = crate::proxy_relay::safe_tx_fee_caps();
+    let outer_gas = crate::proxy_relay::safe_exec_outer_gas_limit(inner_gas_limit);
     let pending = safe
         .execTransaction(
             to,
             U256::ZERO,
             calldata.into(),
-             0u8,
+            0u8,
             U256::ZERO,
             U256::ZERO,
             U256::ZERO,
@@ -126,6 +128,7 @@ async fn safe_exec_call<P: Provider>(
             Address::ZERO,
             sig_bytes.into(),
         )
+        .gas(outer_gas)
         .max_fee_per_gas(max_fee)
         .max_priority_fee_per_gas(max_prio)
         .send()
@@ -226,11 +229,11 @@ pub async fn wrap_usdce_to_pusd<P: Provider>(
             let allowance = erc20_allowance(prov_read, wallet, USDC_POLYGON, COLLATERAL_ONRAMP).await?;
             if allowance < amount {
                 let approve = encode_erc20_approve(COLLATERAL_ONRAMP, amount);
-                let tx = safe_exec_call(safe, signer, USDC_POLYGON, approve).await?;
+                let tx = safe_exec_call(safe, signer, USDC_POLYGON, approve, None).await?;
                 info!("✅ Safe USDC.e approve for Onramp: {:#x}", tx);
             }
             let wrap_calldata = encode_onramp_wrap(wallet, amount);
-            let tx = safe_exec_call(safe, signer, COLLATERAL_ONRAMP, wrap_calldata).await?;
+            let tx = safe_exec_call(safe, signer, COLLATERAL_ONRAMP, wrap_calldata, None).await?;
             info!("✅ Safe wrap tx: {:#x}", tx);
         }
         WalletKind::DepositWallet | WalletKind::MagicProxy => {

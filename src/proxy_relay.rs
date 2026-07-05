@@ -143,6 +143,38 @@ pub fn map_safe_exec_error(e: impl std::fmt::Display, eoa: Address) -> anyhow::E
     }
 }
 
+pub const SAFE_EXEC_DEFAULT_GAS: u64 = 300_000;
+pub const SAFE_EXEC_OVERHEAD_GAS: u64 = 200_000;
+
+/// Outer transaction gas for direct Safe execTransaction calls.
+///
+/// Supplying this avoids provider-side estimateGas simulations that can cap
+/// available gas by the signer EOA's POL balance and surface as opaque
+/// `execution reverted, data: 0x` errors before a transaction hash exists.
+pub fn safe_exec_outer_gas_limit(inner_call_gas: Option<u64>) -> u64 {
+    inner_call_gas
+        .map(|gas| gas.saturating_add(SAFE_EXEC_OVERHEAD_GAS))
+        .unwrap_or(SAFE_EXEC_DEFAULT_GAS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_exec_outer_gas_limit_adds_safe_overhead_to_inner_call_gas() {
+        assert_eq!(
+            safe_exec_outer_gas_limit(Some(PROXY_MERGE_PUSD_GAS)),
+            650_000
+        );
+    }
+
+    #[test]
+    fn safe_exec_outer_gas_limit_has_default_for_simple_safe_calls() {
+        assert_eq!(safe_exec_outer_gas_limit(None), 300_000);
+    }
+}
+
 /// Shorten long 0x-prefixed hex to `0x` + first 8 + `..` + last 6 for logs.
 pub fn short_hex(s: &str) -> String {
     let hex = s.strip_prefix("0x").unwrap_or(s);

@@ -335,6 +335,7 @@ async fn safe_exec_call<P: Provider>(
     signer: &impl alloy::signers::Signer,
     to: Address,
     calldata: Vec<u8>,
+    inner_gas_limit: Option<u64>,
 ) -> Result<B256> {
     let nonce: U256 = safe
         .nonce()
@@ -368,6 +369,7 @@ async fn safe_exec_call<P: Provider>(
         sig_bytes[64] += 27;
     }
     let (max_fee, max_prio) = proxy_relay::safe_tx_fee_caps();
+    let outer_gas = proxy_relay::safe_exec_outer_gas_limit(inner_gas_limit);
     let pending = safe
         .execTransaction(
             to,
@@ -381,6 +383,7 @@ async fn safe_exec_call<P: Provider>(
             Address::ZERO,
             sig_bytes.into(),
         )
+        .gas(outer_gas)
         .max_fee_per_gas(max_fee)
         .max_priority_fee_per_gas(max_prio)
         .send()
@@ -595,11 +598,11 @@ pub async fn merge_max(
         .await?
     {
         let approve_calldata = encode_set_approval_for_all(CTF_COLLATERAL_ADAPTER, true);
-        let tx = safe_exec_call(&safe, &signer, CTF_POLYGON, approve_calldata).await?;
+        let tx = safe_exec_call(&safe, &signer, CTF_POLYGON, approve_calldata, None).await?;
         info!("✅ Safe setApprovalForAll tx: {:#x}", tx);
     }
 
-    let tx_hash_out = safe_exec_call(&safe, &signer, merge_to, merge_calldata).await?;
+    let tx_hash_out = safe_exec_call(&safe, &signer, merge_to, merge_calldata, gas_limit).await?;
     verify_merged(
         &prov_read,
         wallet,
