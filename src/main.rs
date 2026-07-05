@@ -10,6 +10,7 @@ use polypulse::control::{
 };
 use polypulse::merge;
 use polypulse::positions::{get_positions, Position};
+use polypulse::redeem;
 use polypulse::ui::{decimal_to_f64, spawn_dashboard_thread, symbol_short, DashboardHandle};
 use polypulse::web::{self, WebAppState};
 
@@ -955,12 +956,74 @@ async fn main() -> Result<()> {
                             sleep(MERGE_INTERVAL).await;
                         }
 
-                        // 3. Market-sell remaining one-sided positions
+                        // 3. Redeem resolved positions from prior rounds so funds are not left
+                        //    locked. Resolved-market tokens can't be merged or sold on the CLOB;
+                        //    only redemption converts them back to collateral.
+                        if let Some(proxy) = config_wd.proxy_address {
+                            match get_positions().await {
+                                Ok(positions) => {
+                                    let mut redeemed: HashSet<B256> = HashSet::new();
+                                    for pos in positions
+                                        .iter()
+                                        .filter(|p| p.redeemable && p.size > dec!(0))
+                                    {
+                                        // pUSD redemption (default) redeems the whole condition at
+                                        // once, so redeem each condition_id only once per round.
+                                        if !redeemed.insert(pos.condition_id) {
+                                            continue;
+                                        }
+                                        match redeem::redeem_one(
+                                            pos.condition_id,
+                                            pos.negative_risk,
+                                            proxy,
+                                            &config_wd.private_key,
+                                            None,
+                                            None,
+                                            None,
+                                            &[],
+                                        )
+                                        .await
+                                        {
+                                            Ok(tx) => {
+                                                info!(
+                                                    "✅ Wind-down: redeemed | condition_id={:#x} | tx={}",
+                                                    pos.condition_id, tx
+                                                );
+                                                dashboard_wd.with_mut(|d| {
+                                                    d.push_event(format!(
+                                                        "Wind-down: redeemed {:#x} tx {}",
+                                                        pos.condition_id, tx
+                                                    ))
+                                                });
+                                            }
+                                            Err(e) => {
+                                                warn!(condition_id = %pos.condition_id, error = %e, "Wind-down: redeem failed");
+                                                control_wd.record_error(format!(
+                                                    "wind-down redeem failed: {e}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Wind-down: failed to get positions, skipping redeem");
+                                }
+                            }
+                        }
+
+                        // 4. Market-sell remaining one-sided positions
                         let wind_down_sell_price =
                             Decimal::try_from(config_wd.wind_down_sell_price).unwrap_or(dec!(0.01));
                         match get_positions().await {
                             Ok(positions) => {
                                 for pos in positions.iter().filter(|p| p.size > dec!(0)) {
+                                    // Resolved markets are no longer tradeable on the CLOB;
+                                    // submitting a sell returns 400 "invalid token id". These
+                                    // should be redeemed, not sold — skip them here.
+                                    if pos.redeemable {
+                                        debug!(token_id = %pos.asset, size = %pos.size, "Wind-down: position resolved (redeemable), skip sell");
+                                        continue;
+                                    }
                                     let size_floor = (pos.size * dec!(100)).floor() / dec!(100);
                                     if size_floor < dec!(0.01) {
                                         debug!(token_id = %pos.asset, size = %pos.size, "Wind-down: position too small, skip sell");
