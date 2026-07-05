@@ -4,7 +4,8 @@ use anyhow::Result;
 use chrono::Utc;
 use polymarket_client_sdk_v2::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk_v2::clob::types::response::{CancelOrdersResponse, PostOrderResponse};
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side};
+use polymarket_client_sdk_v2::clob::types::{OrderStatusType, OrderType, Side};
+use polymarket_client_sdk_v2::error::{Error as SdkError, Method, Status, StatusCode};
 use polymarket_client_sdk_v2::types::{Decimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
 use rust_decimal::prelude::ToPrimitive;
@@ -135,6 +136,45 @@ impl TradingExecutor {
     /// in the book and must stay gated & sequential.
     fn is_concurrent_order_type(order_type: &OrderType) -> bool {
         matches!(order_type, OrderType::FOK | OrderType::FAK)
+    }
+
+    fn ioc_no_match_zero_fill_response(e: &SdkError) -> Option<PostOrderResponse> {
+        let status = e.downcast_ref::<Status>()?;
+        if status.status_code != StatusCode::BAD_REQUEST
+            || status.method != Method::POST
+            || status.path != "/order"
+        {
+            return None;
+        }
+
+        let body = serde_json::from_str::<serde_json::Value>(&status.message).ok();
+        let error_msg = body
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(|value| value.as_str())
+            .unwrap_or(status.message.as_str());
+        let lower = error_msg.to_ascii_lowercase();
+        if !lower.contains("no orders found to match")
+            || !(lower.contains("fak") || lower.contains("fok"))
+        {
+            return None;
+        }
+        let order_id = body
+            .as_ref()
+            .and_then(|value| value.get("orderID").or_else(|| value.get("order_id")))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+
+        Some(
+            PostOrderResponse::builder()
+                .error_msg(error_msg.to_string())
+                .making_amount(dec!(0))
+                .taking_amount(dec!(0))
+                .order_id(order_id.to_string())
+                .status(OrderStatusType::Unmatched)
+                .success(false)
+                .build(),
+        )
     }
 
     fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
@@ -405,6 +445,14 @@ impl TradingExecutor {
                 self.client.post_order(signed_yes),
                 self.client.post_order(signed_no),
             );
+            let yes_r = yes_r.or_else(|e| match Self::ioc_no_match_zero_fill_response(&e) {
+                Some(r) => Ok(r),
+                None => Err(e),
+            });
+            let no_r = no_r.or_else(|e| match Self::ioc_no_match_zero_fill_response(&e) {
+                Some(r) => Ok(r),
+                None => Err(e),
+            });
             match (yes_r, no_r) {
                 (Ok(y), Ok(n)) => (y, n),
                 (Ok(y), Err(e)) => {
@@ -1113,6 +1161,8 @@ impl TradingExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polymarket_client_sdk_v2::clob::types::OrderStatusType;
+    use polymarket_client_sdk_v2::error::{Error, Method, StatusCode};
 
     #[test]
     fn capped_order_size_uses_smallest_available_size_and_runtime_cap() {
@@ -1166,6 +1216,28 @@ mod tests {
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FAK));
         assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTC));
         assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTD));
+    }
+
+    #[test]
+    fn ioc_no_match_status_error_becomes_zero_fill_response() {
+        let error_msg = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
+        let order_id = "0x4653ad7380243091897d557c0cae43e475ea817d588a9ebc018bbba5cb5ce9aa";
+        let err = Error::status(
+            StatusCode::BAD_REQUEST,
+            Method::POST,
+            "/order".to_string(),
+            format!(r#"{{"error":"{}","orderID":"{}"}}"#, error_msg, order_id),
+        );
+
+        let response = TradingExecutor::ioc_no_match_zero_fill_response(&err)
+            .expect("FAK/FOK no-match status should normalize to zero fill");
+
+        assert_eq!(response.error_msg.as_deref(), Some(error_msg));
+        assert_eq!(response.making_amount, dec!(0));
+        assert_eq!(response.taking_amount, dec!(0));
+        assert_eq!(response.order_id, order_id);
+        assert_eq!(response.status, OrderStatusType::Unmatched);
+        assert!(!response.success);
     }
 
     #[test]
