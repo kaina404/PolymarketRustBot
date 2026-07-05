@@ -133,15 +133,17 @@ impl Config {
                 .unwrap_or_else(|_| "0.01".to_string())
                 .parse()
                 .unwrap_or(0.01), // default 0.01
-            slippage: parse_slippage(&env::var("SLIPPAGE").unwrap_or_else(|_| "0,0.01".to_string())),
+            slippage: parse_slippage(
+                &env::var("SLIPPAGE").unwrap_or_else(|_| "0,0.01".to_string()),
+            ),
             gtd_expiration_secs: env::var("GTD_EXPIRATION_SECS")
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()
                 .unwrap_or(300), // default 300s (5 min)
             arbitrage_hedge_grace_secs: env::var("ARBITRAGE_HEDGE_GRACE_SECS")
-                .unwrap_or_else(|_| "20".to_string())
+                .unwrap_or_else(|_| "3".to_string())
                 .parse()
-                .unwrap_or(20), // default 20s grace for the second leg
+                .unwrap_or(3), // default 3s imbalance reconciliation window
             arbitrage_order_type: parse_arbitrage_order_type(
                 &env::var("ARBITRAGE_ORDER_TYPE").unwrap_or_else(|_| "GTD".to_string()),
             ),

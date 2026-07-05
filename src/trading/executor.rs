@@ -464,12 +464,31 @@ impl TradingExecutor {
             total_elapsed
         );
 
-        // Reconcile if the legs came back unbalanced (scheme B): give the lagging
-        // leg a grace period to fill, then cancel remainders and market-unwind
-        // whichever leg over-filled, so we don't sit on a one-sided position.
-        let (yes_filled, no_filled) = self
-            .reconcile_pair_after_grace(&pair_id, &yes_result, yes_token_id, &no_result, no_token_id)
-            .await;
+        // Reconcile if the legs came back unbalanced. Concurrent (FOK/FAK) fills are
+        // terminal, so instead of a passive grace-wait we actively try to complete
+        // the under-filled leg (profit-gated) before unwinding. GTC/GTD keep the
+        // scheme-B grace-wait-then-unwind path.
+        let (yes_filled, no_filled) = if concurrent {
+            self.reconcile_concurrent_rehedge(
+                &pair_id,
+                &yes_result,
+                yes_token_id,
+                yes_price_with_slippage,
+                &no_result,
+                no_token_id,
+                no_price_with_slippage,
+            )
+            .await
+        } else {
+            self.reconcile_pair_after_grace(
+                &pair_id,
+                &yes_result,
+                yes_token_id,
+                &no_result,
+                no_token_id,
+            )
+            .await
+        };
 
         if yes_filled == dec!(0) && no_filled == dec!(0) {
             let yes_error_msg = yes_result.error_msg.as_deref().unwrap_or("unknown error");
@@ -655,6 +674,32 @@ impl TradingExecutor {
         Some((yes_final > no_final, imbalance))
     }
 
+    /// Plan the re-hedge top-up for an imbalanced concurrent pair. Returns `None`
+    /// when the legs are balanced within the 5-share minimum. Otherwise:
+    /// `topup_yes` — buy more YES (true) or NO (false), whichever is under-filled;
+    /// `shortfall` — shares needed to balance;
+    /// `max_buy_price` — the highest price we can pay on the under-filled leg while
+    /// keeping the pair profitable, i.e. `1 - (over-filled leg's entry price)`
+    /// (clamped at 0). A completing buy above this locks in a loss, worse than
+    /// unwinding, so the caller only tops up below it.
+    fn rehedge_target(
+        yes_have: Decimal,
+        no_have: Decimal,
+        yes_price: Decimal,
+        no_price: Decimal,
+    ) -> Option<(bool, Decimal, Decimal)> {
+        let imbalance = ((yes_have - no_have).abs() * dec!(100)).floor() / dec!(100);
+        if imbalance < dec!(5) {
+            return None;
+        }
+        let topup_yes = yes_have < no_have;
+        // The over-filled (held) leg's entry price bounds how much we can pay to
+        // complete the other side and still keep total cost < $1.
+        let held_price = if topup_yes { no_price } else { yes_price };
+        let max_buy_price = (dec!(1) - held_price).max(dec!(0));
+        Some((topup_yes, imbalance, max_buy_price))
+    }
+
     /// Final matched size for an order via CLOB order lookup.
     async fn matched_size(&self, order_id: &str) -> Option<Decimal> {
         self.client
@@ -672,6 +717,60 @@ impl TradingExecutor {
             .iter()
             .map(|lvl| lvl.price)
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    /// Best (lowest) ask price for a token, independent of book ordering.
+    async fn best_ask(&self, token: U256) -> Option<Decimal> {
+        let req = OrderBookSummaryRequest::builder().token_id(token).build();
+        let book = self.client.order_book(&req).await.ok()?;
+        book.asks
+            .iter()
+            .map(|lvl| lvl.price)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    /// Buy `size` shares of `token` at `price` via FAK (take available liquidity,
+    /// kill the rest — never rests as a naked order). Best-effort: returns the
+    /// shares filled, or 0 if the build/sign/submit fails (logged).
+    async fn buy_at_price(&self, token: U256, price: Decimal, size: Decimal) -> Decimal {
+        let signer = match LocalSigner::from_str(&self.private_key) {
+            Ok(s) => s.with_chain_id(Some(POLYGON)),
+            Err(e) => {
+                warn!("Re-hedge buy signer failed: {}", e);
+                return dec!(0);
+            }
+        };
+        let order = match self
+            .client
+            .limit_order()
+            .token_id(token)
+            .side(Side::Buy)
+            .price(price)
+            .size(size)
+            .order_type(OrderType::FAK)
+            .build()
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Re-hedge buy build failed: {}", e);
+                return dec!(0);
+            }
+        };
+        let signed = match self.client.sign(&signer, order).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Re-hedge buy sign failed: {}", e);
+                return dec!(0);
+            }
+        };
+        match self.client.post_order(signed).await {
+            Ok(r) => r.taking_amount,
+            Err(e) => {
+                warn!("Re-hedge buy submit failed: {}", e);
+                dec!(0)
+            }
+        }
     }
 
     /// Market-unwind one over-filled leg at best-bid minus 2 ticks. Best-effort:
@@ -743,14 +842,10 @@ impl TradingExecutor {
             return (yes_immediate, no_immediate);
         }
 
-        // FOK/FAK fills are already terminal — no resting remainder will fill
-        // later — so reconcile immediately; waiting would only leave the naked leg
-        // exposed for hedge_grace_secs longer. GTC/GTD keep the grace wait.
-        let grace = if Self::is_concurrent_order_type(&self.arbitrage_order_type) {
-            0
-        } else {
-            self.hedge_grace_secs
-        };
+        // GTC/GTD rest in the book, so give the lagging leg a grace period to fill
+        // before reconciling. (Concurrent FOK/FAK are handled by
+        // reconcile_concurrent_rehedge and never reach here.)
+        let grace = self.hedge_grace_secs;
         warn!(
             "⚖️ Legs unbalanced (YES {} / NO {}); grace {}s then reconcile | {}",
             yes_immediate,
@@ -807,6 +902,109 @@ impl TradingExecutor {
             (yes_final - sold, no_final)
         } else {
             (yes_final, no_final - sold)
+        }
+    }
+
+    /// Reconciliation for concurrent (FOK/FAK) legs. Their fills are terminal, so a
+    /// passive grace-wait would only lengthen naked exposure. Instead: if the legs
+    /// came back imbalanced, spend up to `hedge_grace_secs` actively topping up the
+    /// under-filled leg — but only while it can fill below the profitability ceiling
+    /// (`1 - held leg price`), so we never complete the pair at a loss. If the
+    /// window expires still imbalanced, market-unwind the over-filled leg (fall back
+    /// to scheme B). Returns the (adjusted) fills for position bookkeeping.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_concurrent_rehedge(
+        &self,
+        pair_id: &str,
+        yes_res: &PostOrderResponse,
+        yes_token: U256,
+        yes_price: Decimal,
+        no_res: &PostOrderResponse,
+        no_token: U256,
+        no_price: Decimal,
+    ) -> (Decimal, Decimal) {
+        let mut yes_have = yes_res.taking_amount;
+        let mut no_have = no_res.taking_amount;
+
+        // Balanced within the 5-share minimum → nothing actionable.
+        if Self::rehedge_target(yes_have, no_have, yes_price, no_price).is_none() {
+            return (yes_have, no_have);
+        }
+
+        warn!(
+            "⚖️ FAK legs unbalanced (YES {} / NO {}); profit-gated re-hedge up to {}s | {}",
+            yes_have,
+            no_have,
+            self.hedge_grace_secs,
+            &pair_id[..8]
+        );
+
+        let start = Instant::now();
+        let window = Duration::from_secs(self.hedge_grace_secs);
+        let poll = Duration::from_secs(1);
+
+        while let Some((topup_yes, shortfall, max_buy_price)) =
+            Self::rehedge_target(yes_have, no_have, yes_price, no_price)
+        {
+            if start.elapsed() >= window {
+                break;
+            }
+            // The held leg is priced out — completing would cost >= $1, a loss.
+            if max_buy_price <= dec!(0) {
+                break;
+            }
+            // Sub-$1 notional can't be ordered on Polymarket → give up topping up.
+            if max_buy_price * shortfall <= dec!(1) {
+                break;
+            }
+
+            let under_token = if topup_yes { yes_token } else { no_token };
+            match self.best_ask(under_token).await {
+                // Profitable liquidity exists → take it up to our price ceiling.
+                Some(ask) if ask < max_buy_price => {
+                    let bought = self
+                        .buy_at_price(under_token, max_buy_price, shortfall)
+                        .await;
+                    if bought > dec!(0) {
+                        if topup_yes {
+                            yes_have += bought;
+                        } else {
+                            no_have += bought;
+                        }
+                        info!(
+                            "⚖️ Re-hedge +{} {} @≤{:.4} | {}",
+                            bought,
+                            if topup_yes { "YES" } else { "NO" },
+                            max_buy_price,
+                            &pair_id[..8]
+                        );
+                        continue; // re-evaluate the imbalance immediately after a fill
+                    }
+                    tokio::time::sleep(poll).await;
+                }
+                // No profitable liquidity yet → wait and re-check within the window.
+                _ => tokio::time::sleep(poll).await,
+            }
+        }
+
+        // Still imbalanced after the window → unwind the over-filled leg.
+        match Self::unwind_plan(yes_have, no_have) {
+            Some((unwind_yes, shares)) => {
+                let (over_token, over_side) = if unwind_yes {
+                    (yes_token, "YES")
+                } else {
+                    (no_token, "NO")
+                };
+                let sold = self
+                    .market_unwind_leg(over_token, over_side, shares, pair_id)
+                    .await;
+                if unwind_yes {
+                    (yes_have - sold, no_have)
+                } else {
+                    (yes_have, no_have - sold)
+                }
+            }
+            None => (yes_have, no_have),
         }
     }
 }
@@ -867,5 +1065,35 @@ mod tests {
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FAK));
         assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTC));
         assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTD));
+    }
+
+    #[test]
+    fn rehedge_target_tops_up_under_filled_leg_with_profit_ceiling() {
+        // Balanced within 5 shares → no re-hedge.
+        assert_eq!(
+            TradingExecutor::rehedge_target(dec!(10), dec!(10), dec!(0.5), dec!(0.5)),
+            None
+        );
+        assert_eq!(
+            TradingExecutor::rehedge_target(dec!(10), dec!(7), dec!(0.5), dec!(0.5)),
+            None
+        );
+        // YES under-filled (NO over-filled at 0.55) → buy YES for the 7-share
+        // shortfall, paying at most 1 - 0.55 = 0.45 to stay profitable.
+        assert_eq!(
+            TradingExecutor::rehedge_target(dec!(3), dec!(10), dec!(0.40), dec!(0.55)),
+            Some((true, dec!(7), dec!(0.45)))
+        );
+        // NO under-filled (YES over-filled at 0.60) → buy NO for the 8-share
+        // shortfall, ceiling 1 - 0.60 = 0.40.
+        assert_eq!(
+            TradingExecutor::rehedge_target(dec!(10), dec!(2), dec!(0.60), dec!(0.30)),
+            Some((false, dec!(8), dec!(0.40)))
+        );
+        // Held leg already >= $1 → ceiling clamps to 0 (completing would be a loss).
+        assert_eq!(
+            TradingExecutor::rehedge_target(dec!(2), dec!(10), dec!(0.5), dec!(1.0)),
+            Some((true, dec!(8), dec!(0)))
+        );
     }
 }

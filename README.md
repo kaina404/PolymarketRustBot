@@ -91,6 +91,7 @@ Get these from Polymarket → Settings → Builder.
 |----------|---------|-------------|
 | `CRYPTO_SYMBOLS` | `btc,eth,sol,xrp` | Symbols to monitor, comma-separated |
 | `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | Execute when `yes + no <= 1 - spread` |
+| `ARBITRAGE_HEDGE_GRACE_SECS` | `3` | Imbalance reconciliation window; GTC/GTD wait for the lagging leg, FOK/FAK actively re-hedge then unwind |
 | `MAX_ORDER_SIZE_USDC` | `100.0` | Max order size per trade |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | Max exposure per round |
 | `MERGE_INTERVAL_MINUTES` | `0` | Scheduled Merge interval (minutes); `0` = disabled |
