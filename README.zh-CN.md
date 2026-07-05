@@ -94,7 +94,7 @@ cargo run              # 运行程序
 | `MAX_ORDER_SIZE_USDC` | `100.0` | 单笔最大下单量 |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | 每轮最大风险敞口 |
 | `MERGE_INTERVAL_MINUTES` | `0` | 定时 Merge 间隔（分钟），`0` 为关闭 |
-| `WIND_DOWN_BEFORE_WINDOW_END_MINUTES` | `0` | 窗口结束前收尾（分钟），`0` 为关闭 |
+| `WIND_DOWN_BEFORE_WINDOW_END_SECONDS` | `0` | 窗口结束前收尾（秒），`0` 为关闭 |
 | `WEB_ENABLED` | `false` | 启用内置 Web 控制台 |
 | `WEB_BIND` | `0.0.0.0:8080` | Web 控制台监听地址 |
 | `ADMIN_TOKEN` | 无 | Web 控制台 Bearer Token，启用时必填 |

@@ -7,8 +7,8 @@ use tokio::sync::oneshot;
 pub struct RuntimeConfig {
     pub max_order_size_usdc: f64,
     pub arbitrage_execution_spread: f64,
-    pub stop_arbitrage_before_end_minutes: u64,
-    pub wind_down_before_window_end_minutes: u64,
+    pub stop_arbitrage_before_end_seconds: u64,
+    pub wind_down_before_window_end_seconds: u64,
     pub min_yes_price_threshold: f64,
     pub min_no_price_threshold: f64,
 }
@@ -18,8 +18,8 @@ impl Default for RuntimeConfig {
         Self {
             max_order_size_usdc: 100.0,
             arbitrage_execution_spread: 0.01,
-            stop_arbitrage_before_end_minutes: 0,
-            wind_down_before_window_end_minutes: 0,
+            stop_arbitrage_before_end_seconds: 0,
+            wind_down_before_window_end_seconds: 0,
             min_yes_price_threshold: 0.0,
             min_no_price_threshold: 0.0,
         }
@@ -30,8 +30,8 @@ impl Default for RuntimeConfig {
 pub struct RuntimeConfigPatch {
     pub max_order_size_usdc: Option<f64>,
     pub arbitrage_execution_spread: Option<f64>,
-    pub stop_arbitrage_before_end_minutes: Option<u64>,
-    pub wind_down_before_window_end_minutes: Option<u64>,
+    pub stop_arbitrage_before_end_seconds: Option<u64>,
+    pub wind_down_before_window_end_seconds: Option<u64>,
     pub min_yes_price_threshold: Option<f64>,
     pub min_no_price_threshold: Option<f64>,
 }
@@ -48,11 +48,11 @@ impl RuntimeConfigPatch {
             validate_unit_interval_open_upper("arbitrage_execution_spread", value)?;
             next.arbitrage_execution_spread = value;
         }
-        if let Some(value) = self.stop_arbitrage_before_end_minutes {
-            next.stop_arbitrage_before_end_minutes = value;
+        if let Some(value) = self.stop_arbitrage_before_end_seconds {
+            next.stop_arbitrage_before_end_seconds = value;
         }
-        if let Some(value) = self.wind_down_before_window_end_minutes {
-            next.wind_down_before_window_end_minutes = value;
+        if let Some(value) = self.wind_down_before_window_end_seconds {
+            next.wind_down_before_window_end_seconds = value;
         }
         if let Some(value) = self.min_yes_price_threshold {
             validate_unit_interval_closed("min_yes_price_threshold", value)?;
@@ -331,8 +331,8 @@ mod tests {
         let mut config = RuntimeConfig {
             max_order_size_usdc: 100.0,
             arbitrage_execution_spread: 0.01,
-            stop_arbitrage_before_end_minutes: 0,
-            wind_down_before_window_end_minutes: 0,
+            stop_arbitrage_before_end_seconds: 0,
+            wind_down_before_window_end_seconds: 0,
             min_yes_price_threshold: 0.0,
             min_no_price_threshold: 0.0,
         };
@@ -340,8 +340,8 @@ mod tests {
         RuntimeConfigPatch {
             max_order_size_usdc: Some(25.5),
             arbitrage_execution_spread: None,
-            stop_arbitrage_before_end_minutes: Some(1),
-            wind_down_before_window_end_minutes: None,
+            stop_arbitrage_before_end_seconds: Some(1),
+            wind_down_before_window_end_seconds: None,
             min_yes_price_threshold: None,
             min_no_price_threshold: Some(0.12),
         }
@@ -350,8 +350,8 @@ mod tests {
 
         assert_eq!(config.max_order_size_usdc, 25.5);
         assert_eq!(config.arbitrage_execution_spread, 0.01);
-        assert_eq!(config.stop_arbitrage_before_end_minutes, 1);
-        assert_eq!(config.wind_down_before_window_end_minutes, 0);
+        assert_eq!(config.stop_arbitrage_before_end_seconds, 1);
+        assert_eq!(config.wind_down_before_window_end_seconds, 0);
         assert_eq!(config.min_yes_price_threshold, 0.0);
         assert_eq!(config.min_no_price_threshold, 0.12);
     }

@@ -105,8 +105,8 @@ fn runtime_config_from_config(config: &Config) -> RuntimeConfig {
     RuntimeConfig {
         max_order_size_usdc: config.max_order_size_usdc,
         arbitrage_execution_spread: config.arbitrage_execution_spread,
-        stop_arbitrage_before_end_minutes: config.stop_arbitrage_before_end_minutes,
-        wind_down_before_window_end_minutes: config.wind_down_before_window_end_minutes,
+        stop_arbitrage_before_end_seconds: config.stop_arbitrage_before_end_seconds,
+        wind_down_before_window_end_seconds: config.wind_down_before_window_end_seconds,
         min_yes_price_threshold: config.min_yes_price_threshold,
         min_no_price_threshold: config.min_no_price_threshold,
     }
@@ -824,14 +824,13 @@ async fn main() -> Result<()> {
 
         // Monitor orderbook updates
         loop {
-            // Wind-down check: run once when <= N minutes to window end (stay in loop until natural switch by new-window detection)
-            // Use second precision; num_minutes() truncation may miss in 5min windows
+            // Wind-down check: run once when <= N seconds to window end (stay in loop until natural switch by new-window detection)
             let runtime_config = control.runtime_config();
-            if runtime_config.wind_down_before_window_end_minutes > 0 && !wind_down_done {
+            if runtime_config.wind_down_before_window_end_seconds > 0 && !wind_down_done {
                 let now = Utc::now();
                 let seconds_until_end = (window_end - now).num_seconds();
                 let threshold_seconds =
-                    runtime_config.wind_down_before_window_end_minutes as i64 * 60;
+                    runtime_config.wind_down_before_window_end_seconds as i64;
                 if seconds_until_end <= threshold_seconds {
                     info!(
                         "🛑 Wind-down triggered | {}s until window end",
@@ -1152,8 +1151,7 @@ async fn main() -> Result<()> {
                                             }
 
                                             // Check if near market end (if stop time configured)
-                                            // Second precision; num_minutes() may miss in 5min markets
-                                            if runtime_config.stop_arbitrage_before_end_minutes > 0 {
+                                            if runtime_config.stop_arbitrage_before_end_seconds > 0 {
                                                 if let Some(market_info) = market_map.get(&pair.market_id) {
                                                     use chrono::Utc;
                                                     let now = Utc::now();
@@ -1161,16 +1159,15 @@ async fn main() -> Result<()> {
                                                         market_info.end_date.signed_duration_since(now);
                                                     let seconds_until_end = time_until_end.num_seconds();
                                                     let threshold_seconds =
-                                                        runtime_config.stop_arbitrage_before_end_minutes
-                                                            as i64
-                                                            * 60;
+                                                        runtime_config.stop_arbitrage_before_end_seconds
+                                                            as i64;
 
                                                     if seconds_until_end <= threshold_seconds {
                                                         debug!(
-                                                            "⏰ Near market end, skip arbitrage | market:{} | seconds to end:{} | stop threshold:{}min",
+                                                            "⏰ Near market end, skip arbitrage | market:{} | seconds to end:{} | stop threshold:{}s",
                                                             market_display,
                                                             seconds_until_end,
-                                                            runtime_config.stop_arbitrage_before_end_minutes
+                                                            runtime_config.stop_arbitrage_before_end_seconds
                                                         );
                                                         continue; // Skip this arbitrage
                                                     }

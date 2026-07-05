@@ -263,8 +263,8 @@
         <div class="config-grid">
           <label><span>最大下单量 USDC(Max order size)</span><input id="cfg-max-order" type="number" min="0.01" step="0.01" /></label>
           <label><span>执行价差(Execution spread)</span><input id="cfg-spread" type="number" min="0" max="0.99" step="0.001" /></label>
-          <label><span>结束前停止套利·分钟(Stop before end)</span><input id="cfg-stop" type="number" min="0" step="1" /></label>
-          <label><span>结束前减仓·分钟(Wind-down before end)</span><input id="cfg-wind" type="number" min="0" step="1" /></label>
+          <label><span>结束前停止套利·秒(Stop before end)</span><input id="cfg-stop" type="number" min="0" step="1" /></label>
+          <label><span>结束前减仓·秒(Wind-down before end)</span><input id="cfg-wind" type="number" min="0" step="1" /></label>
           <label><span>最低 YES 价格(Min YES price)</span><input id="cfg-yes" type="number" min="0" max="1" step="0.001" /></label>
           <label><span>最低 NO 价格(Min NO price)</span><input id="cfg-no" type="number" min="0" max="1" step="0.001" /></label>
         </div>
@@ -358,8 +358,8 @@
       if (configDirty) return; // 正在编辑，跳过回填，避免覆盖用户输入
       document.getElementById('cfg-max-order').value = config.max_order_size_usdc;
       document.getElementById('cfg-spread').value = config.arbitrage_execution_spread;
-      document.getElementById('cfg-stop').value = config.stop_arbitrage_before_end_minutes;
-      document.getElementById('cfg-wind').value = config.wind_down_before_window_end_minutes;
+      document.getElementById('cfg-stop').value = config.stop_arbitrage_before_end_seconds;
+      document.getElementById('cfg-wind').value = config.wind_down_before_window_end_seconds;
       document.getElementById('cfg-yes').value = config.min_yes_price_threshold;
       document.getElementById('cfg-no').value = config.min_no_price_threshold;
     }
@@ -424,8 +424,8 @@
       const body = {
         max_order_size_usdc: Number(document.getElementById('cfg-max-order').value),
         arbitrage_execution_spread: Number(document.getElementById('cfg-spread').value),
-        stop_arbitrage_before_end_minutes: Number(document.getElementById('cfg-stop').value),
-        wind_down_before_window_end_minutes: Number(document.getElementById('cfg-wind').value),
+        stop_arbitrage_before_end_seconds: Number(document.getElementById('cfg-stop').value),
+        wind_down_before_window_end_seconds: Number(document.getElementById('cfg-wind').value),
         min_yes_price_threshold: Number(document.getElementById('cfg-yes').value),
         min_no_price_threshold: Number(document.getElementById('cfg-no').value)
       };

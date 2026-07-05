@@ -94,7 +94,7 @@ Get these from Polymarket → Settings → Builder.
 | `MAX_ORDER_SIZE_USDC` | `100.0` | Max order size per trade |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | Max exposure per round |
 | `MERGE_INTERVAL_MINUTES` | `0` | Scheduled Merge interval (minutes); `0` = disabled |
-| `WIND_DOWN_BEFORE_WINDOW_END_MINUTES` | `0` | Wind-down before window end (minutes); `0` = disabled |
+| `WIND_DOWN_BEFORE_WINDOW_END_SECONDS` | `0` | Wind-down before window end (seconds); `0` = disabled |
 | `WEB_ENABLED` | `false` | Enable the embedded web control console |
 | `WEB_BIND` | `0.0.0.0:8080` | Web control console bind address |
 | `ADMIN_TOKEN` | none | Web control console Bearer token, required when enabled |

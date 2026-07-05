@@ -53,7 +53,7 @@ pub struct Config {
     pub gtd_expiration_secs: u64, // GTD order expiry (seconds), default 300 (5 min); only when arbitrage_order_type=GTD
     /// Order type for arbitrage: GTC (good till cancel), GTD (with gtd_expiration_secs), FOK (fill or kill), FAK (fill and kill remainder)
     pub arbitrage_order_type: OrderType,
-    pub stop_arbitrage_before_end_minutes: u64, // Stop arbitrage N minutes before market end, default 0 (no stop)
+    pub stop_arbitrage_before_end_seconds: u64, // Stop arbitrage N seconds before market end, default 0 (no stop)
     /// Scheduled Merge interval (minutes); 0 = disabled. CONDITION_ID from current window markets like orderbook.
     pub merge_interval_minutes: u64,
     /// YES price threshold: only execute arbitrage when YES >= this, default 0.0 (no limit)
@@ -68,8 +68,8 @@ pub struct Config {
     pub position_balance_threshold: f64,
     /// Min total position: run balance only when total >= this, default 5.0
     pub position_balance_min_total: f64,
-    /// Wind-down before window end: minutes before 5min window end to trigger (cancel→Merge→market sell rest). 0=disabled.
-    pub wind_down_before_window_end_minutes: u64,
+    /// Wind-down before window end: seconds before 5min window end to trigger (cancel→Merge→market sell rest). 0=disabled.
+    pub wind_down_before_window_end_seconds: u64,
     /// Limit price for one-sided leg sells during wind-down (aim for fast fill), default 0.01
     pub wind_down_sell_price: f64,
 }
@@ -137,7 +137,7 @@ impl Config {
             arbitrage_order_type: parse_arbitrage_order_type(
                 &env::var("ARBITRAGE_ORDER_TYPE").unwrap_or_else(|_| "GTD".to_string()),
             ),
-            stop_arbitrage_before_end_minutes: env::var("STOP_ARBITRAGE_BEFORE_END_MINUTES")
+            stop_arbitrage_before_end_seconds: env::var("STOP_ARBITRAGE_BEFORE_END_SECONDS")
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()
                 .unwrap_or(0), // default 0 (no stop)
@@ -169,7 +169,7 @@ impl Config {
                 .unwrap_or_else(|_| "5.0".to_string())
                 .parse()
                 .unwrap_or(5.0), // default 5.0
-            wind_down_before_window_end_minutes: env::var("WIND_DOWN_BEFORE_WINDOW_END_MINUTES")
+            wind_down_before_window_end_seconds: env::var("WIND_DOWN_BEFORE_WINDOW_END_SECONDS")
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()
                 .unwrap_or(0), // 0=disabled
