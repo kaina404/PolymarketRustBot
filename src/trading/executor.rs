@@ -7,6 +7,7 @@ use polymarket_client_sdk_v2::clob::types::response::{CancelOrdersResponse, Post
 use polymarket_client_sdk_v2::clob::types::{OrderType, Side};
 use polymarket_client_sdk_v2::types::{Decimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -136,6 +137,75 @@ impl TradingExecutor {
         matches!(order_type, OrderType::FOK | OrderType::FAK)
     }
 
+    fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+        while b != 0 {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        a
+    }
+
+    fn lcm_u128(a: u128, b: u128) -> u128 {
+        if a == 0 || b == 0 {
+            return 0;
+        }
+        (a / Self::gcd_u128(a, b)).saturating_mul(b)
+    }
+
+    fn decimal_floor_units(value: Decimal, scale: u32) -> u128 {
+        if value <= dec!(0) {
+            return 0;
+        }
+        let factor = Decimal::from(10_u128.pow(scale));
+        (value * factor).floor().to_u128().unwrap_or(u128::MAX)
+    }
+
+    fn decimal_from_units(units: u128, scale: u32) -> Decimal {
+        Decimal::from_i128_with_scale(i128::try_from(units).unwrap_or(i128::MAX), scale)
+    }
+
+    fn buy_size_unit_multiple_for_cent_notional(price: Decimal) -> u128 {
+        if price <= dec!(0) {
+            return u128::MAX;
+        }
+
+        let price = price.normalize();
+        let price_units = match u128::try_from(price.mantissa()) {
+            Ok(units) if units > 0 => units,
+            _ => return u128::MAX,
+        };
+        let price_scale = price.scale();
+        let price_denominator = 10_u128.pow(price_scale);
+        price_denominator / Self::gcd_u128(price_units, price_denominator)
+    }
+
+    fn buy_size_for_api_amount_precision(price: Decimal, size: Decimal) -> Decimal {
+        let size_units = Self::decimal_floor_units(size, 2);
+        let multiple = Self::buy_size_unit_multiple_for_cent_notional(price);
+        if size_units == 0 || multiple == 0 || multiple == u128::MAX {
+            return dec!(0);
+        }
+
+        Self::decimal_from_units(size_units - (size_units % multiple), 2)
+    }
+
+    fn buy_pair_size_for_api_amount_precision(
+        yes_price: Decimal,
+        no_price: Decimal,
+        size: Decimal,
+    ) -> Decimal {
+        let size_units = Self::decimal_floor_units(size, 2);
+        let yes_multiple = Self::buy_size_unit_multiple_for_cent_notional(yes_price);
+        let no_multiple = Self::buy_size_unit_multiple_for_cent_notional(no_price);
+        let multiple = Self::lcm_u128(yes_multiple, no_multiple);
+        if size_units == 0 || multiple == 0 || multiple == u128::MAX {
+            return dec!(0);
+        }
+
+        Self::decimal_from_units(size_units - (size_units % multiple), 2)
+    }
+
     /// Execute arbitrage: submit YES+NO via sequential post_order (V2); order type from config
     /// yes_dir / no_dir: direction "↑" "↓" "−" or "" for slippage (down=second, up/flat=first)
     pub async fn execute_arbitrage_pair(
@@ -203,6 +273,32 @@ impl TradingExecutor {
         let no_slippage_apply = self.slippage_for_direction(no_dir);
         let yes_price_with_slippage = (opp.yes_ask_price + yes_slippage_apply).min(dec!(1.0));
         let no_price_with_slippage = (opp.no_ask_price + no_slippage_apply).min(dec!(1.0));
+        let raw_order_size = order_size;
+        let order_size = Self::buy_pair_size_for_api_amount_precision(
+            yes_price_with_slippage,
+            no_price_with_slippage,
+            raw_order_size,
+        );
+        if order_size < dec!(5) {
+            warn!(
+                "⏭️ Skip arbitrage pair | size:{} -> {} after API amount precision | market:{}",
+                raw_order_size, order_size, opp.market_id
+            );
+            return Err(anyhow::anyhow!(
+                "order size {} below minimum 5 shares after API amount precision adjustment",
+                order_size
+            ));
+        }
+        if order_size < raw_order_size {
+            debug!(
+                "Buy size adjusted for API amount precision | market:{} | {} -> {} | YES:{} NO:{}",
+                opp.market_id,
+                raw_order_size,
+                order_size,
+                yes_price_with_slippage,
+                no_price_with_slippage
+            );
+        }
 
         info!(
             "📋 Level | YES {:.4}×{:.2} NO {:.4}×{:.2}",
@@ -733,6 +829,11 @@ impl TradingExecutor {
     /// kill the rest — never rests as a naked order). Best-effort: returns the
     /// shares filled, or 0 if the build/sign/submit fails (logged).
     async fn buy_at_price(&self, token: U256, price: Decimal, size: Decimal) -> Decimal {
+        let size = Self::buy_size_for_api_amount_precision(price, size);
+        if size < dec!(5) {
+            return dec!(0);
+        }
+
         let signer = match LocalSigner::from_str(&self.private_key) {
             Ok(s) => s.with_chain_id(Some(POLYGON)),
             Err(e) => {
@@ -1065,6 +1166,19 @@ mod tests {
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FAK));
         assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTC));
         assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTD));
+    }
+
+    #[test]
+    fn buy_pair_size_quantizes_notional_to_market_buy_precision() {
+        let adjusted = TradingExecutor::buy_pair_size_for_api_amount_precision(
+            dec!(0.41),
+            dec!(0.53),
+            dec!(9.4),
+        );
+
+        assert_eq!(adjusted, dec!(9));
+        assert_eq!((dec!(0.41) * adjusted).normalize().scale(), 2);
+        assert_eq!((dec!(0.53) * adjusted).normalize().scale(), 2);
     }
 
     #[test]
