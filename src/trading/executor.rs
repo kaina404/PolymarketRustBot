@@ -273,8 +273,9 @@ impl TradingExecutor {
         let total_start = Instant::now();
 
         // FOK/FAK and GTD fire both legs concurrently. FOK/FAK are terminal IOC
-        // orders; GTD rests are cancelled after the grace window and recorded.
-        // GTC stays gated & sequential because it can rest forever.
+        // orders; GTD legs are left resting (no auto-cancel) until they fill or
+        // the GTD expiry elapses. GTC stays gated & sequential because it can
+        // rest forever.
         let concurrent = Self::is_concurrent_order_type(&self.arbitrage_order_type);
 
         let expiry_info = if matches!(self.arbitrage_order_type, OrderType::GTD) {
@@ -440,9 +441,9 @@ impl TradingExecutor {
             // gating.
             //
             // Concurrency does NOT eliminate one-sided fills. FOK/FAK residuals
-            // are terminal and reconciled by re-hedge/unwind. GTD rests are
-            // cancelled after the grace window; any final imbalance is left to
-            // the normal position/wind-down lifecycle.
+            // are terminal and reconciled by re-hedge/unwind. GTD legs are left
+            // resting (no auto-cancel) to fill or expire on their own; any final
+            // imbalance is left to the normal position/wind-down lifecycle.
             debug!(
                 "Concurrent send ({}); no pre-submit gating | {}",
                 self.arbitrage_order_type,
@@ -474,12 +475,12 @@ impl TradingExecutor {
                                 .await;
                         }
                     } else {
-                        let y_filled = self
-                            .cancel_resting_and_final_matched(&y, "YES", &pair_id)
-                            .await;
+                        // GTD: leave the posted YES leg resting (no auto-cancel).
+                        // It fills or expires with the market; a transient
+                        // one-sided leg is accepted per the resting-GTD strategy.
                         warn!(
-                            "⚠️ NO submit failed; cancelled GTD YES remainder after fill {} | {}",
-                            y_filled,
+                            "⚠️ NO submit failed; leaving GTD YES leg resting (filled {} so far, no cancel) | {}",
+                            y.taking_amount,
                             &pair_id[..8]
                         );
                     }
@@ -507,12 +508,12 @@ impl TradingExecutor {
                                 .await;
                         }
                     } else {
-                        let n_filled = self
-                            .cancel_resting_and_final_matched(&n, "NO", &pair_id)
-                            .await;
+                        // GTD: leave the posted NO leg resting (no auto-cancel).
+                        // It fills or expires with the market; a transient
+                        // one-sided leg is accepted per the resting-GTD strategy.
                         warn!(
-                            "⚠️ YES submit failed; cancelled GTD NO remainder after fill {} | {}",
-                            n_filled,
+                            "⚠️ YES submit failed; leaving GTD NO leg resting (filled {} so far, no cancel) | {}",
+                            n.taking_amount,
                             &pair_id[..8]
                         );
                     }
@@ -639,9 +640,10 @@ impl TradingExecutor {
 
         // Reconcile if the legs came back unbalanced. Concurrent FOK/FAK fills
         // are terminal, so actively try to complete the under-filled leg
-        // (profit-gated) before unwinding. Concurrent GTD orders can still rest,
-        // so cancel after the grace window and record final matched sizes without
-        // forcing an unwind. Sequential GTC uses the original gated path.
+        // (profit-gated) before unwinding. Concurrent GTD legs are left resting
+        // (no auto-cancel); we only snapshot their fills and let them work until
+        // they fill or the GTD expiry elapses. Sequential GTC uses the original
+        // gated path.
         let (yes_filled, no_filled) =
             if Self::is_terminal_ioc_order_type(&self.arbitrage_order_type) {
                 self.reconcile_concurrent_rehedge(
@@ -655,7 +657,7 @@ impl TradingExecutor {
                 )
                 .await
             } else if concurrent {
-                self.reconcile_concurrent_resting_after_grace(&pair_id, &yes_result, &no_result)
+                self.record_concurrent_resting_fills(&pair_id, &yes_result, &no_result)
                     .await
             } else {
                 self.reconcile_pair_after_grace(
@@ -887,29 +889,15 @@ impl TradingExecutor {
             .map(|o| o.size_matched)
     }
 
-    async fn cancel_resting_order(&self, order_id: &str, side: &str, pair_id: &str) {
-        if order_id.is_empty() {
-            return;
-        }
-        if let Err(e) = self.client.cancel_order(order_id).await {
-            warn!(
-                "⚠️ Failed to cancel resting {} leg | id:{} | err:{} | {}",
-                side,
-                order_id,
-                e,
-                &pair_id[..8]
-            );
-        }
-    }
-
-    async fn cancel_resting_and_final_matched(
+    /// Matched size for a posted leg WITHOUT cancelling it — GTD legs are left
+    /// resting to fill or expire on their own. Falls back to the immediate fill
+    /// when there is no order id or the order lookup fails.
+    async fn final_matched_or_immediate(
         &self,
         res: &PostOrderResponse,
         side: &str,
         pair_id: &str,
     ) -> Decimal {
-        self.cancel_resting_order(&res.order_id, side, pair_id)
-            .await;
         if res.order_id.is_empty() {
             return res.taking_amount;
         }
@@ -917,7 +905,7 @@ impl TradingExecutor {
             Some(size) => size,
             None => {
                 warn!(
-                    "⚠️ Could not query final matched size for {} after cancel; using immediate fill {} | {}",
+                    "⚠️ Could not query matched size for {}; using immediate fill {} | {}",
                     side,
                     res.taking_amount,
                     &pair_id[..8]
@@ -1043,11 +1031,13 @@ impl TradingExecutor {
         }
     }
 
-    /// Reconciliation for concurrent resting orders (currently GTD). The goal is
-    /// only to stop remaining exposure from drifting after both legs were fired:
-    /// wait the grace window, cancel both remainders, and return final matched
-    /// sizes. It deliberately does not re-hedge or market-unwind any imbalance.
-    async fn reconcile_concurrent_resting_after_grace(
+    /// Fill bookkeeping for concurrent resting orders (currently GTD). Both legs
+    /// were fired concurrently and are LEFT RESTING — this neither cancels nor
+    /// unwinds anything. It waits the grace window so any immediate crossing has
+    /// time to settle, then snapshots each leg's matched size for position
+    /// tracking. Any unfilled remainder keeps working until it fills or the GTD
+    /// expiry elapses.
+    async fn record_concurrent_resting_fills(
         &self,
         pair_id: &str,
         yes_res: &PostOrderResponse,
@@ -1055,7 +1045,7 @@ impl TradingExecutor {
     ) -> (Decimal, Decimal) {
         let grace = self.hedge_grace_secs;
         debug!(
-            "GTD concurrent orders posted; grace {}s then cancel remainders | {}",
+            "GTD concurrent orders posted; grace {}s then snapshot fills (left resting, no cancel) | {}",
             grace,
             &pair_id[..8]
         );
@@ -1064,14 +1054,14 @@ impl TradingExecutor {
         }
 
         let (yes_final, no_final) = tokio::join!(
-            self.cancel_resting_and_final_matched(yes_res, "YES", pair_id),
-            self.cancel_resting_and_final_matched(no_res, "NO", pair_id),
+            self.final_matched_or_immediate(yes_res, "YES", pair_id),
+            self.final_matched_or_immediate(no_res, "NO", pair_id),
         );
 
         let residual = ((yes_final - no_final).abs() * dec!(100)).floor() / dec!(100);
         if residual >= dec!(5) {
             warn!(
-                "⚖️ GTD concurrent final imbalance YES {} / NO {}; no auto-unwind | {}",
+                "⚖️ GTD concurrent imbalance YES {} / NO {}; legs left resting (no auto-cancel/unwind) | {}",
                 yes_final,
                 no_final,
                 &pair_id[..8]
@@ -1321,9 +1311,9 @@ mod tests {
 
     #[test]
     fn concurrent_send_includes_gtd_but_not_gtc() {
-        // FOK/FAK are terminal and GTD has an expiry plus post-submit
-        // reconciliation, so these can send both legs concurrently. GTC can rest
-        // forever and must stay gated.
+        // FOK/FAK are terminal and GTD legs are left resting under their own
+        // expiry (no auto-cancel), so these can send both legs concurrently. GTC
+        // can rest forever and must stay gated.
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FOK));
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FAK));
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::GTD));
