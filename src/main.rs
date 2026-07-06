@@ -611,6 +611,14 @@ async fn main() -> Result<()> {
         config.arbitrage_order_type.clone(),
         config.arbitrage_hedge_grace_secs,
     ));
+    let arbitrage_slippage = [
+        Decimal::try_from(config.slippage[0]).unwrap_or(dec!(0.0)),
+        Decimal::try_from(config.slippage[1]).unwrap_or(dec!(0.01)),
+    ];
+    let arbitrage_min_available_shares =
+        Decimal::try_from(config.arbitrage_min_available_shares).unwrap_or(dec!(5.0));
+    let arbitrage_order_size_ratio =
+        Decimal::try_from(config.arbitrage_order_size_ratio).unwrap_or(dec!(1.0));
 
     let _risk_manager = Arc::new(RiskManager::new(clob_client.clone(), &config));
 
@@ -1322,21 +1330,62 @@ async fn main() -> Result<()> {
                                             }
 
                                             // Calculate order cost (USD)
-                                            // Use actual available size from arb, but cap at max order size
+                                            // Use actual available size from arb, cap it, then submit only the configured ratio.
                                             use rust_decimal::Decimal;
                                             let max_order_size =
                                                 Decimal::try_from(runtime_config.max_order_size_usdc)
                                                     .unwrap_or(dec!(100.0));
-                                            let order_size = opp.yes_size.min(opp.no_size).min(max_order_size);
-                                            let yes_cost = opp.yes_ask_price * order_size;
-                                            let no_cost = opp.no_ask_price * order_size;
+                                            let available_size = TradingExecutor::capped_order_size(
+                                                opp.yes_size,
+                                                opp.no_size,
+                                                max_order_size,
+                                            );
+                                            if available_size < arbitrage_min_available_shares {
+                                                debug!(
+                                                    "⏭️ Available shares below configured minimum, skip arbitrage | market:{} | available:{} | minimum:{}",
+                                                    market_display,
+                                                    available_size,
+                                                    arbitrage_min_available_shares
+                                                );
+                                                continue; // Skip this arbitrage
+                                            }
+                                            let order_size = TradingExecutor::apply_order_size_ratio(
+                                                available_size,
+                                                arbitrage_order_size_ratio,
+                                            );
+                                            let yes_limit_price = TradingExecutor::limit_price_with_slippage(
+                                                opp.yes_ask_price,
+                                                &yes_dir,
+                                                arbitrage_slippage,
+                                            );
+                                            let no_limit_price = TradingExecutor::limit_price_with_slippage(
+                                                opp.no_ask_price,
+                                                &no_dir,
+                                                arbitrage_slippage,
+                                            );
+                                            let total_limit_price = yes_limit_price + no_limit_price;
+                                            if total_limit_price > execution_threshold {
+                                                debug!(
+                                                    "⏭️ Slippage-adjusted total above threshold, skip arbitrage | market:{} | total:{:.4} | threshold:{:.4} | YES:{:.4} | NO:{:.4}",
+                                                    market_display,
+                                                    total_limit_price,
+                                                    execution_threshold,
+                                                    yes_limit_price,
+                                                    no_limit_price
+                                                );
+                                                continue; // Skip this arbitrage
+                                            }
+                                            let yes_cost = yes_limit_price * order_size;
+                                            let no_cost = no_limit_price * order_size;
                                             let total_cost = yes_cost + no_cost;
 
                                             // Skip if buyable shares < 5 (Polymarket min order size); avoids API 400 "Size lower than the minimum: 5"
                                             if order_size < dec!(5) {
                                                 debug!(
-                                                    "⏭️ Buyable shares below minimum (5), skip arbitrage | market:{} | size:{} | cost:{:.2} USD",
+                                                    "⏭️ Buyable shares below minimum (5), skip arbitrage | market:{} | available:{} | ratio:{} | size:{} | cost:{:.2} USD",
                                                     market_display,
+                                                    available_size,
+                                                    arbitrage_order_size_ratio,
                                                     order_size,
                                                     total_cost
                                                 );
@@ -1386,15 +1435,16 @@ async fn main() -> Result<()> {
                                             }
 
                                             let trade_sym = symbol_short(market_symbol);
+                                            let execution_profit_percentage =
+                                                (dec!(1.0) - total_limit_price) * dec!(100.0);
                                             let profit_usd = decimal_to_f64(
-                                                (dec!(1.0) - opp.yes_ask_price - opp.no_ask_price)
-                                                    * order_size,
+                                                (dec!(1.0) - total_limit_price) * order_size,
                                             );
                                             dashboard.with_mut(|d| {
                                                 d.set_exposure(decimal_to_f64(current_exposure));
                                                 d.record_trade_attempt(
                                                     &trade_sym,
-                                                    decimal_to_f64(opp.profit_percentage),
+                                                    decimal_to_f64(execution_profit_percentage),
                                                     decimal_to_f64(order_size),
                                                     decimal_to_f64(total_cost),
                                                 );
@@ -1403,7 +1453,7 @@ async fn main() -> Result<()> {
                                                 info!(
                                                     "⚡ Execute arbitrage | market:{} | profit:{:.2}% | size:{} | cost:{:.2} USD | exposure:{:.2} USD",
                                                     market_display,
-                                                    opp.profit_percentage,
+                                                    execution_profit_percentage,
                                                     order_size,
                                                     total_cost,
                                                     current_exposure
@@ -1411,8 +1461,8 @@ async fn main() -> Result<()> {
                                             }
                                             // Simplified exposure: add on arb execution regardless of fill
                                             let _pt = _risk_manager.position_tracker();
-                                            _pt.update_exposure_cost(opp.yes_token_id, opp.yes_ask_price, order_size);
-                                            _pt.update_exposure_cost(opp.no_token_id, opp.no_ask_price, order_size);
+                                            _pt.update_exposure_cost(opp.yes_token_id, yes_limit_price, order_size);
+                                            _pt.update_exposure_cost(opp.no_token_id, no_limit_price, order_size);
 
                                             // Arb execution: run whenever total <= threshold, direction only for slippage (down=second, up/flat=first)
                                             // Clone vars for spawned task (direction used for slippage allocation)
@@ -1423,7 +1473,10 @@ async fn main() -> Result<()> {
                                             let no_dir_s = no_dir.to_string();
                                             let dashboard_trade = dashboard.clone();
                                             let trade_sym_spawn = trade_sym.clone();
-                                            let runtime_max_order_size = max_order_size;
+                                            let runtime_order_size_cap = order_size;
+                                            let runtime_execution_threshold = execution_threshold;
+                                            let execution_profit_pct_spawn =
+                                                decimal_to_f64(execution_profit_percentage);
 
                                             // Spawn async to avoid blocking orderbook updates
                                             tokio::spawn(async move {
@@ -1433,7 +1486,8 @@ async fn main() -> Result<()> {
                                                         &opp_clone,
                                                         &yes_dir_s,
                                                         &no_dir_s,
-                                                        runtime_max_order_size,
+                                                        runtime_order_size_cap,
+                                                        runtime_execution_threshold,
                                                     )
                                                     .await
                                                 {
@@ -1443,7 +1497,7 @@ async fn main() -> Result<()> {
                                                                 d.record_trade_success(
                                                                     &trade_sym_spawn,
                                                                     profit_usd,
-                                                                    decimal_to_f64(opp_clone.profit_percentage),
+                                                                    execution_profit_pct_spawn,
                                                                 );
                                                             });
                                                         } else {

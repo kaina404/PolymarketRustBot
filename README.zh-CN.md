@@ -91,6 +91,9 @@ cargo run              # 运行程序
 |------|--------|------|
 | `CRYPTO_SYMBOLS` | `btc,eth,sol,xrp` | 监控的币种，逗号分隔 |
 | `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | 执行阈值：`yes + no <= 1 - spread` 时下单 |
+| `ARBITRAGE_MIN_AVAILABLE_SHARES` | `5.0` | 提交套利前要求 capped 可用份额达到该下限 |
+| `ARBITRAGE_ORDER_SIZE_RATIO` | `1.0` | 按 capped 可用份额的该比例提交；`0.8` 表示提交 80% |
+| `SLIPPAGE` | `0,0.01` | 单腿价格缓冲；加缓冲后的 `YES + NO` 仍必须满足执行阈值 |
 | `ARBITRAGE_HEDGE_GRACE_SECS` | `3` | 两腿不平衡处理窗口；GTC/GTD 并发下单后两腿原地挂着不撤单（GTD 靠到期清理，GTC 靠窗口切换 cancel_all 清理），FOK/FAK 主动补腿后再平仓 |
 | `MAX_ORDER_SIZE_USDC` | `100.0` | 单笔最大下单量 |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | 每轮最大风险敞口 |

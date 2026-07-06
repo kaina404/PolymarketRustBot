@@ -110,17 +110,50 @@ impl TradingExecutor {
             .map_err(|e| anyhow::anyhow!("Sell order submit failed: {}", e))
     }
 
-    /// Slippage by direction: down(↓) uses second, up(↑) and flat(−/empty) use first
-    fn slippage_for_direction(&self, dir: &str) -> Decimal {
+    pub(crate) fn slippage_for_direction_values(dir: &str, slippage: [Decimal; 2]) -> Decimal {
         if dir == "↓" {
-            self.slippage[1]
+            slippage[1]
         } else {
-            self.slippage[0]
+            slippage[0]
         }
     }
 
-    fn capped_order_size(yes_size: Decimal, no_size: Decimal, max_order_size: Decimal) -> Decimal {
+    pub(crate) fn capped_order_size(
+        yes_size: Decimal,
+        no_size: Decimal,
+        max_order_size: Decimal,
+    ) -> Decimal {
         yes_size.min(no_size).min(max_order_size)
+    }
+
+    pub(crate) fn apply_order_size_ratio(size: Decimal, ratio: Decimal) -> Decimal {
+        if ratio <= dec!(0) {
+            return dec!(0);
+        }
+        let ratio = ratio.min(dec!(1));
+        (size * ratio * dec!(100)).floor() / dec!(100)
+    }
+
+    pub(crate) fn limit_price_with_slippage(
+        price: Decimal,
+        dir: &str,
+        slippage: [Decimal; 2],
+    ) -> Decimal {
+        let add = Self::slippage_for_direction_values(dir, slippage);
+        (price + add).min(dec!(1.0))
+    }
+
+    pub(crate) fn prices_with_slippage_within_threshold(
+        yes_price: Decimal,
+        no_price: Decimal,
+        yes_dir: &str,
+        no_dir: &str,
+        slippage: [Decimal; 2],
+        execution_threshold: Decimal,
+    ) -> bool {
+        let yes_limit = Self::limit_price_with_slippage(yes_price, yes_dir, slippage);
+        let no_limit = Self::limit_price_with_slippage(no_price, no_dir, slippage);
+        yes_limit + no_limit <= execution_threshold
     }
 
     /// Whether to send the second (hedging) leg, given the first leg's immediate
@@ -261,8 +294,14 @@ impl TradingExecutor {
         yes_dir: &str,
         no_dir: &str,
     ) -> Result<OrderPairResult> {
-        self.execute_arbitrage_pair_with_max_order_size(opp, yes_dir, no_dir, self.max_order_size)
-            .await
+        self.execute_arbitrage_pair_with_max_order_size(
+            opp,
+            yes_dir,
+            no_dir,
+            self.max_order_size,
+            dec!(1.0),
+        )
+        .await
     }
 
     /// Execute arbitrage with an explicit runtime max-order cap.
@@ -272,6 +311,7 @@ impl TradingExecutor {
         yes_dir: &str,
         no_dir: &str,
         max_order_size: Decimal,
+        execution_threshold: Decimal,
     ) -> Result<OrderPairResult> {
         let total_start = Instant::now();
 
@@ -315,13 +355,26 @@ impl TradingExecutor {
             ));
         }
 
+        let yes_price_with_slippage =
+            Self::limit_price_with_slippage(opp.yes_ask_price, yes_dir, self.slippage);
+        let no_price_with_slippage =
+            Self::limit_price_with_slippage(opp.no_ask_price, no_dir, self.slippage);
+        let total_limit_price = yes_price_with_slippage + no_price_with_slippage;
+        if total_limit_price > execution_threshold {
+            warn!(
+                "⏭️ Skip arbitrage pair | slippage-adjusted total:{:.4} > threshold:{:.4} | market:{}",
+                total_limit_price, execution_threshold, opp.market_id
+            );
+            return Err(anyhow::anyhow!(
+                "slippage-adjusted total {} exceeds execution threshold {}",
+                total_limit_price,
+                execution_threshold
+            ));
+        }
+
         let pair_id = Uuid::new_v4().to_string();
         let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
 
-        let yes_slippage_apply = self.slippage_for_direction(yes_dir);
-        let no_slippage_apply = self.slippage_for_direction(no_dir);
-        let yes_price_with_slippage = (opp.yes_ask_price + yes_slippage_apply).min(dec!(1.0));
-        let no_price_with_slippage = (opp.no_ask_price + no_slippage_apply).min(dec!(1.0));
         let raw_order_size = order_size;
         let order_size = Self::buy_pair_size_for_api_amount_precision(
             yes_price_with_slippage,
@@ -1283,6 +1336,38 @@ mod tests {
             TradingExecutor::capped_order_size(dec!(50), dec!(9), dec!(25)),
             dec!(9)
         );
+    }
+
+    #[test]
+    fn sized_order_applies_ratio_after_available_cap_and_floors_to_cents() {
+        let available = TradingExecutor::capped_order_size(dec!(20), dec!(40), dec!(100));
+        let scaled = TradingExecutor::apply_order_size_ratio(available, dec!(0.8));
+        assert_eq!(scaled, dec!(16));
+
+        let odd_available = TradingExecutor::capped_order_size(dec!(20.019), dec!(40), dec!(100));
+        let odd_scaled = TradingExecutor::apply_order_size_ratio(odd_available, dec!(0.8));
+        assert_eq!(odd_scaled, dec!(16.01));
+    }
+
+    #[test]
+    fn slippage_adjusted_prices_must_stay_under_execution_threshold() {
+        let slippage = [dec!(0.01), dec!(0.01)];
+        assert!(TradingExecutor::prices_with_slippage_within_threshold(
+            dec!(0.45),
+            dec!(0.50),
+            "↑",
+            "−",
+            slippage,
+            dec!(0.97),
+        ));
+        assert!(!TradingExecutor::prices_with_slippage_within_threshold(
+            dec!(0.46),
+            dec!(0.50),
+            "↑",
+            "−",
+            slippage,
+            dec!(0.97),
+        ));
     }
 
     #[test]
