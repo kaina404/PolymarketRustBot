@@ -94,7 +94,8 @@ Get these from Polymarket → Settings → Builder.
 | `MAX_ORDERBOOK_PAIR_SKEW_MS` | `200` | Skip an arbitrage check when cached YES/NO book timestamps differ by more than this many milliseconds; restart required after changing |
 | `ARBITRAGE_MIN_AVAILABLE_SHARES` | `5.0` | Require capped available shares before submitting an arbitrage pair |
 | `ARBITRAGE_ORDER_SIZE_RATIO` | `1.0` | Submit this fraction of capped available shares; `0.8` sends 80% |
-| `SLIPPAGE` | `0,0.01` | Per-leg price buffer; adjusted `YES + NO` must still satisfy the execution spread |
+| `SLIPPAGE` | `0,0.01` | Per-leg price buffer for submitted limit prices |
+| `ARBITRAGE_VALIDATE_SLIPPAGE_ADJUSTED_TOTAL` | `false` | When `true`, require slippage-adjusted `YES + NO` to still satisfy the execution spread |
 | `ARBITRAGE_HEDGE_GRACE_SECS` | `3` | Imbalance window; GTC/GTD concurrent legs are left resting (no auto-cancel — GTD cleared by its expiry, GTC by cancel_all at window switch), FOK/FAK actively re-hedge then unwind |
 | `MAX_ORDER_SIZE_USDC` | `100.0` | Max order size per trade |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | Max exposure per round |
@@ -103,7 +104,7 @@ Get these from Polymarket → Settings → Builder.
 | `WEB_ENABLED` | `false` | Enable the embedded web control console |
 | `WEB_BIND` | `0.0.0.0:8080` | Web control console bind address |
 | `ADMIN_TOKEN` | none | Web control console Bearer token, required when enabled |
-| `CONTROL_STATE_PATH` | `data/control_state.json` | Persists pause/resume and runtime config across process restarts |
+| `CONTROL_STATE_PATH` | `data/control_state.json` | Persists runtime config across process restarts; trading always starts paused and requires manual resume |
 | `RUST_LOG` | `info` | Log level |
 
 Other settings (CLOB URL, signature type, slippage, order type, position sync, etc.) have sensible defaults. See `.env.example` for the full list with bilingual comments.
@@ -123,7 +124,7 @@ CONTROL_STATE_PATH=/app/data/control_state.json
 
 Expose it only through a fixed domain with HTTPS termination at your reverse proxy. Every API request requires `Authorization: Bearer <ADMIN_TOKEN>`; manual Merge, cancel-all, and shutdown also require backend `confirm=true`. The console does not expose or edit private keys, proxy addresses, Builder credentials, or the CLOB URL.
 
-Persist `/app/data` as a Docker volume if you want pause/resume state and runtime parameter edits to survive container replacement, not only process restarts.
+Persist `/app/data` as a Docker volume if you want runtime parameter edits to survive container replacement, not only process restarts. For safety, every process start begins with trading paused even if the previous process was manually resumed; use the web console to resume trading after startup checks pass.
 
 ## Disclaimer
 

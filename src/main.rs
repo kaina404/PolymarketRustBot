@@ -540,7 +540,7 @@ async fn main() -> Result<()> {
         "Control state persistence enabled"
     );
     if control.trading_paused() {
-        dashboard.with_mut(|d| d.push_event("Trading paused by persisted control state"));
+        dashboard.with_mut(|d| d.push_event("Trading paused until manual resume after startup"));
     }
     let (command_tx, command_rx) = mpsc::channel::<CommandRequest>(32);
     if use_tui {
@@ -610,6 +610,7 @@ async fn main() -> Result<()> {
         config.private_key.clone(),
         config.max_order_size_usdc,
         config.slippage,
+        config.arbitrage_validate_slippage_adjusted_total,
         config.gtd_expiration_secs,
         config.arbitrage_order_type.clone(),
         config.arbitrage_hedge_grace_secs,
@@ -622,6 +623,8 @@ async fn main() -> Result<()> {
         Decimal::try_from(config.arbitrage_min_available_shares).unwrap_or(dec!(5.0));
     let arbitrage_order_size_ratio =
         Decimal::try_from(config.arbitrage_order_size_ratio).unwrap_or(dec!(1.0));
+    let arbitrage_validate_slippage_adjusted_total =
+        config.arbitrage_validate_slippage_adjusted_total;
 
     let _risk_manager = Arc::new(RiskManager::new(clob_client.clone(), &config));
 
@@ -889,8 +892,7 @@ async fn main() -> Result<()> {
             if runtime_config.wind_down_before_window_end_seconds > 0 && !wind_down_done {
                 let now = Utc::now();
                 let seconds_until_end = (window_end - now).num_seconds();
-                let threshold_seconds =
-                    runtime_config.wind_down_before_window_end_seconds as i64;
+                let threshold_seconds = runtime_config.wind_down_before_window_end_seconds as i64;
                 if seconds_until_end <= threshold_seconds {
                     info!(
                         "🛑 Wind-down triggered | {}s until window end",
@@ -1032,17 +1034,20 @@ async fn main() -> Result<()> {
                                     // Skip zero-value positions; winners have cur_price>0.
                                     let skipped_worthless = positions
                                         .iter()
-                                        .filter(|p| p.redeemable && p.size > dec!(0) && p.cur_price <= dec!(0))
+                                        .filter(|p| {
+                                            p.redeemable
+                                                && p.size > dec!(0)
+                                                && p.cur_price <= dec!(0)
+                                        })
                                         .count();
                                     if skipped_worthless > 0 {
                                         info!(
                                             "Wind-down: skipped {skipped_worthless} resolved losing positions (payout 0, nothing to redeem)"
                                         );
                                     }
-                                    for pos in positions
-                                        .iter()
-                                        .filter(|p| p.redeemable && p.size > dec!(0) && p.cur_price > dec!(0))
-                                    {
+                                    for pos in positions.iter().filter(|p| {
+                                        p.redeemable && p.size > dec!(0) && p.cur_price > dec!(0)
+                                    }) {
                                         // pUSD redemption (default) redeems the whole condition at
                                         // once, so redeem each condition_id only once per round.
                                         if !redeemed.insert(pos.condition_id) {
@@ -1061,7 +1066,8 @@ async fn main() -> Result<()> {
                                         .await;
                                         // 免费 RPC 限流(429)时退避重试一次；仍失败则本轮跳过，
                                         // 下一轮 wind-down 会再次尝试（持仓仍 redeemable）。
-                                        if matches!(&result, Err(e) if is_rate_limit_error(&e.to_string())) {
+                                        if matches!(&result, Err(e) if is_rate_limit_error(&e.to_string()))
+                                        {
                                             warn!(
                                                 condition_id = %pos.condition_id,
                                                 "Wind-down: RPC 限流，等待 12s 后重试 redeem"
@@ -1368,11 +1374,27 @@ async fn main() -> Result<()> {
                                                 arbitrage_slippage,
                                             );
                                             let total_limit_price = yes_limit_price + no_limit_price;
-                                            if total_limit_price > execution_threshold {
+                                            let threshold_total_price =
+                                                TradingExecutor::threshold_total_price(
+                                                    opp.yes_ask_price,
+                                                    opp.no_ask_price,
+                                                    &yes_dir,
+                                                    &no_dir,
+                                                    arbitrage_slippage,
+                                                    arbitrage_validate_slippage_adjusted_total,
+                                                );
+                                            if threshold_total_price > execution_threshold {
+                                                let threshold_basis =
+                                                    if arbitrage_validate_slippage_adjusted_total {
+                                                        "slippage-adjusted"
+                                                    } else {
+                                                        "raw"
+                                                    };
                                                 debug!(
-                                                    "⏭️ Slippage-adjusted total above threshold, skip arbitrage | market:{} | total:{:.4} | threshold:{:.4} | YES:{:.4} | NO:{:.4}",
+                                                    "⏭️ {} total above threshold, skip arbitrage | market:{} | total:{:.4} | threshold:{:.4} | YES:{:.4} | NO:{:.4}",
+                                                    threshold_basis,
                                                     market_display,
-                                                    total_limit_price,
+                                                    threshold_total_price,
                                                     execution_threshold,
                                                     yes_limit_price,
                                                     no_limit_price

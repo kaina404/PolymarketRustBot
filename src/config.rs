@@ -72,6 +72,8 @@ pub struct Config {
     pub max_orderbook_pair_skew_ms: u64,
     /// Slippage [first, second]: down-only uses second, up/flat uses first. e.g. "-0.02,0.0"
     pub slippage: [f64; 2],
+    /// When true, slippage-adjusted YES+NO must also satisfy the execution threshold.
+    pub arbitrage_validate_slippage_adjusted_total: bool,
     pub gtd_expiration_secs: u64, // GTD order expiry (seconds), default 300 (5 min); only when arbitrage_order_type=GTD
     /// Grace period (seconds) to let the lagging (second) leg fill before
     /// reconciling an imbalanced pair: cancel resting remainders and market-unwind
@@ -172,6 +174,11 @@ impl Config {
             slippage: parse_slippage(
                 &env::var("SLIPPAGE").unwrap_or_else(|_| "0,0.01".to_string()),
             ),
+            arbitrage_validate_slippage_adjusted_total: env::var(
+                "ARBITRAGE_VALIDATE_SLIPPAGE_ADJUSTED_TOTAL",
+            )
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
             gtd_expiration_secs: env::var("GTD_EXPIRATION_SECS")
                 .unwrap_or_else(|_| "300".to_string())
                 .parse()

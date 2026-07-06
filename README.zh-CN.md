@@ -94,7 +94,8 @@ cargo run              # 运行程序
 | `MAX_ORDERBOOK_PAIR_SKEW_MS` | `200` | YES/NO orderbook 时间戳偏差超过该毫秒数时跳过本次套利判断；修改后需重启 |
 | `ARBITRAGE_MIN_AVAILABLE_SHARES` | `5.0` | 提交套利前要求 capped 可用份额达到该下限 |
 | `ARBITRAGE_ORDER_SIZE_RATIO` | `1.0` | 按 capped 可用份额的该比例提交；`0.8` 表示提交 80% |
-| `SLIPPAGE` | `0,0.01` | 单腿价格缓冲；加缓冲后的 `YES + NO` 仍必须满足执行阈值 |
+| `SLIPPAGE` | `0,0.01` | 单腿提交限价缓冲 |
+| `ARBITRAGE_VALIDATE_SLIPPAGE_ADJUSTED_TOTAL` | `false` | 为 `true` 时，要求加缓冲后的 `YES + NO` 仍满足执行阈值 |
 | `ARBITRAGE_HEDGE_GRACE_SECS` | `3` | 两腿不平衡处理窗口；GTC/GTD 并发下单后两腿原地挂着不撤单（GTD 靠到期清理，GTC 靠窗口切换 cancel_all 清理），FOK/FAK 主动补腿后再平仓 |
 | `MAX_ORDER_SIZE_USDC` | `100.0` | 单笔最大下单量 |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | 每轮最大风险敞口 |
@@ -103,7 +104,7 @@ cargo run              # 运行程序
 | `WEB_ENABLED` | `false` | 启用内置 Web 控制台 |
 | `WEB_BIND` | `0.0.0.0:8080` | Web 控制台监听地址 |
 | `ADMIN_TOKEN` | 无 | Web 控制台 Bearer Token，启用时必填 |
-| `CONTROL_STATE_PATH` | `data/control_state.json` | 跨进程重启保留暂停/恢复交易和运行时参数 |
+| `CONTROL_STATE_PATH` | `data/control_state.json` | 跨进程重启保留运行时参数；交易每次启动都默认暂停，需手动恢复 |
 | `RUST_LOG` | `info` | 日志级别 |
 
 其余参数（CLOB 地址、签名类型、滑点、订单类型、持仓同步等）均有合理默认值，一般无需修改。完整列表与注释见 `.env.example`。
@@ -123,7 +124,7 @@ CONTROL_STATE_PATH=/app/data/control_state.json
 
 请只通过固定域名 + HTTPS 反向代理访问控制台。所有 API 都要求 `Authorization: Bearer <ADMIN_TOKEN>`；手动 Merge、取消全部订单、停止程序还要求后端收到 `confirm=true`。控制台不会暴露或允许修改私钥、代理地址、Builder 凭证、CLOB URL。
 
-如果希望暂停/恢复状态和运行时参数在容器重建后仍保留，请把 `/app/data` 挂载为 Docker 持久卷；仅重启同一个进程/容器时默认路径已经会保留。
+如果希望运行时参数在容器重建后仍保留，请把 `/app/data` 挂载为 Docker 持久卷；仅重启同一个进程/容器时默认路径已经会保留。出于安全考虑，每次进程启动都会先暂停交易，即使上一次运行中已经手动恢复；启动检查通过后再通过 Web 控制台恢复交易。
 
 ## 免责声明
 

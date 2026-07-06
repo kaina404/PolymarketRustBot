@@ -34,6 +34,7 @@ pub struct TradingExecutor {
     private_key: String,
     max_order_size: Decimal,
     slippage: [Decimal; 2], // [first, second]: down uses second, up/flat uses first
+    validate_slippage_adjusted_total: bool,
     gtd_expiration_secs: u64,
     arbitrage_order_type: OrderType,
     hedge_grace_secs: u64,
@@ -45,6 +46,7 @@ impl TradingExecutor {
         private_key: String,
         max_order_size_usdc: f64,
         slippage: [f64; 2],
+        validate_slippage_adjusted_total: bool,
         gtd_expiration_secs: u64,
         arbitrage_order_type: OrderType,
         hedge_grace_secs: u64,
@@ -58,6 +60,7 @@ impl TradingExecutor {
                 Decimal::try_from(slippage[0]).unwrap_or(dec!(0.0)),
                 Decimal::try_from(slippage[1]).unwrap_or(dec!(0.01)),
             ],
+            validate_slippage_adjusted_total,
             gtd_expiration_secs,
             arbitrage_order_type,
             hedge_grace_secs,
@@ -154,6 +157,22 @@ impl TradingExecutor {
         let yes_limit = Self::limit_price_with_slippage(yes_price, yes_dir, slippage);
         let no_limit = Self::limit_price_with_slippage(no_price, no_dir, slippage);
         yes_limit + no_limit <= execution_threshold
+    }
+
+    pub(crate) fn threshold_total_price(
+        yes_price: Decimal,
+        no_price: Decimal,
+        yes_dir: &str,
+        no_dir: &str,
+        slippage: [Decimal; 2],
+        validate_slippage_adjusted_total: bool,
+    ) -> Decimal {
+        if validate_slippage_adjusted_total {
+            Self::limit_price_with_slippage(yes_price, yes_dir, slippage)
+                + Self::limit_price_with_slippage(no_price, no_dir, slippage)
+        } else {
+            yes_price + no_price
+        }
     }
 
     /// Whether to send the second (hedging) leg, given the first leg's immediate
@@ -359,15 +378,28 @@ impl TradingExecutor {
             Self::limit_price_with_slippage(opp.yes_ask_price, yes_dir, self.slippage);
         let no_price_with_slippage =
             Self::limit_price_with_slippage(opp.no_ask_price, no_dir, self.slippage);
-        let total_limit_price = yes_price_with_slippage + no_price_with_slippage;
-        if total_limit_price > execution_threshold {
+        let threshold_total_price = Self::threshold_total_price(
+            opp.yes_ask_price,
+            opp.no_ask_price,
+            yes_dir,
+            no_dir,
+            self.slippage,
+            self.validate_slippage_adjusted_total,
+        );
+        if threshold_total_price > execution_threshold {
+            let threshold_basis = if self.validate_slippage_adjusted_total {
+                "slippage-adjusted"
+            } else {
+                "raw"
+            };
             warn!(
-                "⏭️ Skip arbitrage pair | slippage-adjusted total:{:.4} > threshold:{:.4} | market:{}",
-                total_limit_price, execution_threshold, opp.market_id
+                "⏭️ Skip arbitrage pair | {} total:{:.4} > threshold:{:.4} | market:{}",
+                threshold_basis, threshold_total_price, execution_threshold, opp.market_id
             );
             return Err(anyhow::anyhow!(
-                "slippage-adjusted total {} exceeds execution threshold {}",
-                total_limit_price,
+                "{} total {} exceeds execution threshold {}",
+                threshold_basis,
+                threshold_total_price,
                 execution_threshold
             ));
         }

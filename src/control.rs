@@ -110,7 +110,7 @@ pub struct RuntimeControlState {
 impl RuntimeControlState {
     pub fn new(runtime_config: RuntimeConfig) -> Self {
         Self {
-            trading_paused: false,
+            trading_paused: true,
             merge_running: false,
             cancel_running: false,
             shutdown_requested: false,
@@ -123,7 +123,7 @@ impl RuntimeControlState {
 
     fn from_persisted(persisted: PersistedControlState) -> Self {
         Self {
-            trading_paused: persisted.trading_paused,
+            trading_paused: true,
             merge_running: false,
             cancel_running: false,
             shutdown_requested: false,
@@ -564,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn control_handle_restores_persistent_state_after_restart() {
+    fn control_handle_forces_trading_paused_after_restart() {
         let path = temp_control_state_path();
         let mut restarted_config = RuntimeConfig::default();
         restarted_config.max_order_size_usdc = 250.0;
@@ -573,8 +573,8 @@ mod tests {
             let handle = ControlHandle::with_persistence(RuntimeConfig::default(), path.clone())
                 .expect("create persistent control handle");
             handle
-                .set_trading_paused(true, "operator paused")
-                .expect("persist pause");
+                .set_trading_paused(false, "operator resumed")
+                .expect("persist active trading");
             handle
                 .update_runtime_config(
                     &RuntimeConfigPatch {
