@@ -1572,6 +1572,14 @@ async fn main() -> Result<()> {
                             new_window = new_window_timestamp,
                             "New 5min window detected, cancelling old subscriptions and switching"
                         );
+                        // Clean slate for the new window: cancel any resting orders
+                        // from the old window. GTC has no expiry, so without this its
+                        // unfilled legs would leak across windows and lock collateral.
+                        // Best-effort — old-window orders can't fill anyway once it
+                        // closes, so log and switch regardless.
+                        if let Err(e) = executor.cancel_all_orders().await {
+                            warn!(error = %e, "Failed to cancel old-window orders at window switch");
+                        }
                         // Drop stream to release monitor borrow, then clear old subs
                         drop(stream);
                         monitor.clear();

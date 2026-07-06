@@ -91,7 +91,7 @@ cargo run              # 运行程序
 |------|--------|------|
 | `CRYPTO_SYMBOLS` | `btc,eth,sol,xrp` | 监控的币种，逗号分隔 |
 | `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | 执行阈值：`yes + no <= 1 - spread` 时下单 |
-| `ARBITRAGE_HEDGE_GRACE_SECS` | `3` | 两腿不平衡处理窗口；GTD 并发下单后两腿原地挂着不撤单（靠 GTD 到期清理），GTC 串行路径等待落后腿，FOK/FAK 主动补腿后再平仓 |
+| `ARBITRAGE_HEDGE_GRACE_SECS` | `3` | 两腿不平衡处理窗口；GTC/GTD 并发下单后两腿原地挂着不撤单（GTD 靠到期清理，GTC 靠窗口切换 cancel_all 清理），FOK/FAK 主动补腿后再平仓 |
 | `MAX_ORDER_SIZE_USDC` | `100.0` | 单笔最大下单量 |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | 每轮最大风险敞口 |
 | `MERGE_INTERVAL_MINUTES` | `0` | 定时 Merge 间隔（分钟），`0` 为关闭 |

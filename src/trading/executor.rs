@@ -131,11 +131,14 @@ impl TradingExecutor {
         first_taking_amount > dec!(0)
     }
 
-    /// FOK/FAK never leave a resting remainder; GTD rests are cancelled after
-    /// the post-submit grace window. These order types can submit both legs
-    /// concurrently. GTC can rest forever and stays gated & sequential.
+    /// All arbitrage order types submit both legs concurrently. FOK/FAK are
+    /// terminal IOC; GTD/GTC are left resting with no auto-cancel (GTD clears via
+    /// its expiry, GTC via cancel_all at window switch). None stay gated.
     fn is_concurrent_order_type(order_type: &OrderType) -> bool {
-        matches!(order_type, OrderType::FOK | OrderType::FAK | OrderType::GTD)
+        matches!(
+            order_type,
+            OrderType::FOK | OrderType::FAK | OrderType::GTD | OrderType::GTC
+        )
     }
 
     fn is_terminal_ioc_order_type(order_type: &OrderType) -> bool {
@@ -550,12 +553,13 @@ impl TradingExecutor {
                 }
             }
         } else {
-            // ===== Gated sequential send (GTC) =====
-            // Fire the pricier leg first, and only fire the second leg once the
-            // first has actually filled. A GTC first leg that rests unfilled
-            // could still fill later, so it is cancelled and the second leg
-            // skipped — closing the "cheap leg fills alone, pricier leg misses
-            // → one-sided (naked) position" gap.
+            // ===== Gated sequential send =====
+            // NOTE: currently unreachable — FOK/FAK/GTD/GTC all send concurrently
+            // (see is_concurrent_order_type). Retained for a potential future order
+            // type that must stay gated: fire the pricier leg first, and only fire
+            // the second leg once the first has actually filled; a first leg that
+            // rests unfilled is cancelled and the second skipped — closing the
+            // "cheap leg fills alone, pricier leg misses → one-sided" gap.
             let yes_first = yes_price_with_slippage >= no_price_with_slippage;
             let (first_signed, second_signed, first_side, second_side) = if yes_first {
                 (signed_yes, signed_no, "YES", "NO")
@@ -1310,14 +1314,14 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_send_includes_gtd_but_not_gtc() {
-        // FOK/FAK are terminal and GTD legs are left resting under their own
-        // expiry (no auto-cancel), so these can send both legs concurrently. GTC
-        // can rest forever and must stay gated.
+    fn concurrent_send_covers_all_order_types() {
+        // FOK/FAK are terminal; GTD/GTC are left resting with no auto-cancel
+        // (GTD via expiry, GTC via cancel_all at window switch). All four send
+        // both legs concurrently.
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FOK));
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::FAK));
         assert!(TradingExecutor::is_concurrent_order_type(&OrderType::GTD));
-        assert!(!TradingExecutor::is_concurrent_order_type(&OrderType::GTC));
+        assert!(TradingExecutor::is_concurrent_order_type(&OrderType::GTC));
     }
 
     #[test]
