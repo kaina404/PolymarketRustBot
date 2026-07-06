@@ -856,6 +856,8 @@ async fn main() -> Result<()> {
 
         // Create position balance timer
         let balance_interval = config.position_balance_interval_secs;
+        // Only start balancing this many seconds before window end; 0 = whole window.
+        let balance_start_secs = config.position_balance_start_before_end_seconds;
         let mut balance_timer = if balance_interval > 0 {
             let mut timer = tokio::time::interval(Duration::from_secs(balance_interval));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1528,8 +1530,16 @@ async fn main() -> Result<()> {
                 _ = async {
                     if let Some(ref mut timer) = balance_timer {
                         timer.tick().await;
-                        if let Err(e) = position_balancer.check_and_balance_positions(&market_token_map).await {
-                            warn!(error = %e, "Position balance check failed");
+                        // Gate: only balance in the final `balance_start_secs` before
+                        // window end, so GTD legs rest untouched earlier and are only
+                        // cleaned up near the end. 0 = balance the whole window.
+                        // The tick cadence (POSITION_BALANCE_INTERVAL_SECS, set to 1s)
+                        // then drives the ~per-second re-check inside that window.
+                        let remaining = (window_end - Utc::now()).num_seconds();
+                        if balance_start_secs == 0 || remaining <= balance_start_secs as i64 {
+                            if let Err(e) = position_balancer.check_and_balance_positions(&market_token_map).await {
+                                warn!(error = %e, "Position balance check failed");
+                            }
                         }
                     } else {
                         futures::future::pending::<()>().await;

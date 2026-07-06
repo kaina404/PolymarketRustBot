@@ -72,6 +72,8 @@ pub struct Config {
     pub position_balance_threshold: f64,
     /// Min total position: run balance only when total >= this, default 5.0
     pub position_balance_min_total: f64,
+    /// Only run position balance in the final N seconds before window end; 0 = whole window (default 0)
+    pub position_balance_start_before_end_seconds: u64,
     /// Wind-down before window end: seconds before 5min window end to trigger (cancel→Merge→market sell rest). 0=disabled.
     pub wind_down_before_window_end_seconds: u64,
     /// Limit price for one-sided leg sells during wind-down (aim for fast fill), default 0.01
@@ -179,6 +181,12 @@ impl Config {
                 .unwrap_or_else(|_| "5.0".to_string())
                 .parse()
                 .unwrap_or(5.0), // default 5.0
+            position_balance_start_before_end_seconds: env::var(
+                "POSITION_BALANCE_START_BEFORE_END_SECONDS",
+            )
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .unwrap_or(0), // 0 = whole window
             wind_down_before_window_end_seconds: env::var("WIND_DOWN_BEFORE_WINDOW_END_SECONDS")
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()
