@@ -31,6 +31,20 @@ fn parse_slippage(s: &str) -> [f64; 2] {
     }
 }
 
+fn parse_positive_finite_or_default(value: Option<&str>, default: f64) -> f64 {
+    value
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(default)
+}
+
+fn parse_unit_ratio_or_default(value: Option<&str>, default: f64) -> f64 {
+    value
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        .unwrap_or(default)
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub private_key: String,
@@ -41,6 +55,8 @@ pub struct Config {
     pub signature_type: String,
     pub min_profit_threshold: f64,
     pub max_order_size_usdc: f64,
+    pub arbitrage_min_available_shares: f64,
+    pub arbitrage_order_size_ratio: f64,
     pub crypto_symbols: Vec<String>,
     pub market_refresh_advance_secs: u64,
     pub risk_max_exposure_usdc: f64,
@@ -106,6 +122,14 @@ impl Config {
                 .unwrap_or_else(|_| "100.0".to_string())
                 .parse()
                 .unwrap_or(100.0),
+            arbitrage_min_available_shares: parse_positive_finite_or_default(
+                env::var("ARBITRAGE_MIN_AVAILABLE_SHARES").ok().as_deref(),
+                5.0,
+            ),
+            arbitrage_order_size_ratio: parse_unit_ratio_or_default(
+                env::var("ARBITRAGE_ORDER_SIZE_RATIO").ok().as_deref(),
+                1.0,
+            ),
             crypto_symbols: env::var("CRYPTO_SYMBOLS")
                 .unwrap_or_else(|_| "btc,eth,xrp,sol".to_string())
                 .split(',')
@@ -196,5 +220,30 @@ impl Config {
                 .parse()
                 .unwrap_or(0.01), // default 0.01
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positive_finite_parser_rejects_zero_negative_nan_and_invalid_values() {
+        assert_eq!(parse_positive_finite_or_default(Some("20.5"), 5.0), 20.5);
+        assert_eq!(parse_positive_finite_or_default(Some("0"), 5.0), 5.0);
+        assert_eq!(parse_positive_finite_or_default(Some("-1"), 5.0), 5.0);
+        assert_eq!(parse_positive_finite_or_default(Some("NaN"), 5.0), 5.0);
+        assert_eq!(parse_positive_finite_or_default(Some("bad"), 5.0), 5.0);
+        assert_eq!(parse_positive_finite_or_default(None, 5.0), 5.0);
+    }
+
+    #[test]
+    fn order_size_ratio_parser_accepts_only_open_zero_closed_one_interval() {
+        assert_eq!(parse_unit_ratio_or_default(Some("0.8"), 1.0), 0.8);
+        assert_eq!(parse_unit_ratio_or_default(Some("1.0"), 1.0), 1.0);
+        assert_eq!(parse_unit_ratio_or_default(Some("0"), 1.0), 1.0);
+        assert_eq!(parse_unit_ratio_or_default(Some("1.01"), 1.0), 1.0);
+        assert_eq!(parse_unit_ratio_or_default(Some("NaN"), 1.0), 1.0);
+        assert_eq!(parse_unit_ratio_or_default(None, 1.0), 1.0);
     }
 }

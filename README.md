@@ -91,6 +91,9 @@ Get these from Polymarket → Settings → Builder.
 |----------|---------|-------------|
 | `CRYPTO_SYMBOLS` | `btc,eth,sol,xrp` | Symbols to monitor, comma-separated |
 | `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | Execute when `yes + no <= 1 - spread` |
+| `ARBITRAGE_MIN_AVAILABLE_SHARES` | `5.0` | Require capped available shares before submitting an arbitrage pair |
+| `ARBITRAGE_ORDER_SIZE_RATIO` | `1.0` | Submit this fraction of capped available shares; `0.8` sends 80% |
+| `SLIPPAGE` | `0,0.01` | Per-leg price buffer; adjusted `YES + NO` must still satisfy the execution spread |
 | `ARBITRAGE_HEDGE_GRACE_SECS` | `3` | Imbalance window; GTC/GTD concurrent legs are left resting (no auto-cancel — GTD cleared by its expiry, GTC by cancel_all at window switch), FOK/FAK actively re-hedge then unwind |
 | `MAX_ORDER_SIZE_USDC` | `100.0` | Max order size per trade |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | Max exposure per round |
