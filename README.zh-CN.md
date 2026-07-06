@@ -91,6 +91,7 @@ cargo run              # 运行程序
 |------|--------|------|
 | `CRYPTO_SYMBOLS` | `btc,eth,sol,xrp` | 监控的币种，逗号分隔 |
 | `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | 执行阈值：`yes + no <= 1 - spread` 时下单 |
+| `MAX_ORDERBOOK_PAIR_SKEW_MS` | `200` | YES/NO orderbook 时间戳偏差超过该毫秒数时跳过本次套利判断；修改后需重启 |
 | `ARBITRAGE_MIN_AVAILABLE_SHARES` | `5.0` | 提交套利前要求 capped 可用份额达到该下限 |
 | `ARBITRAGE_ORDER_SIZE_RATIO` | `1.0` | 按 capped 可用份额的该比例提交；`0.8` 表示提交 80% |
 | `SLIPPAGE` | `0,0.01` | 单腿价格缓冲；加缓冲后的 `YES + NO` 仍必须满足执行阈值 |

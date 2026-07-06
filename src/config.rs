@@ -45,6 +45,10 @@ fn parse_unit_ratio_or_default(value: Option<&str>, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn parse_u64_or_default(value: Option<&str>, default: u64) -> u64 {
+    value.and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub private_key: String,
@@ -64,6 +68,8 @@ pub struct Config {
     pub hedge_take_profit_pct: f64, // Hedge take-profit % (e.g. 0.05 = 5%)
     pub hedge_stop_loss_pct: f64,   // Hedge stop-loss % (e.g. 0.05 = 5%)
     pub arbitrage_execution_spread: f64, // Execute arbitrage when yes+no <= 1 - this spread
+    /// Max allowed timestamp skew between YES and NO orderbook snapshots before skipping the pair.
+    pub max_orderbook_pair_skew_ms: u64,
     /// Slippage [first, second]: down-only uses second, up/flat uses first. e.g. "-0.02,0.0"
     pub slippage: [f64; 2],
     pub gtd_expiration_secs: u64, // GTD order expiry (seconds), default 300 (5 min); only when arbitrage_order_type=GTD
@@ -159,6 +165,10 @@ impl Config {
                 .unwrap_or_else(|_| "0.01".to_string())
                 .parse()
                 .unwrap_or(0.01), // default 0.01
+            max_orderbook_pair_skew_ms: parse_u64_or_default(
+                env::var("MAX_ORDERBOOK_PAIR_SKEW_MS").ok().as_deref(),
+                crate::monitor::DEFAULT_MAX_ORDERBOOK_PAIR_SKEW_MS,
+            ),
             slippage: parse_slippage(
                 &env::var("SLIPPAGE").unwrap_or_else(|_| "0,0.01".to_string()),
             ),
@@ -245,5 +255,15 @@ mod tests {
         assert_eq!(parse_unit_ratio_or_default(Some("1.01"), 1.0), 1.0);
         assert_eq!(parse_unit_ratio_or_default(Some("NaN"), 1.0), 1.0);
         assert_eq!(parse_unit_ratio_or_default(None, 1.0), 1.0);
+    }
+
+    #[test]
+    fn u64_parser_rejects_negative_float_and_invalid_values() {
+        assert_eq!(parse_u64_or_default(Some("200"), 100), 200);
+        assert_eq!(parse_u64_or_default(Some("0"), 100), 0);
+        assert_eq!(parse_u64_or_default(Some("-1"), 100), 100);
+        assert_eq!(parse_u64_or_default(Some("1.5"), 100), 100);
+        assert_eq!(parse_u64_or_default(Some("bad"), 100), 100);
+        assert_eq!(parse_u64_or_default(None, 100), 100);
     }
 }

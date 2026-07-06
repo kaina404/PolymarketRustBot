@@ -516,7 +516,10 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    tracing::info!("Config loaded");
+    tracing::info!(
+        max_orderbook_pair_skew_ms = config.max_orderbook_pair_skew_ms,
+        "Config loaded"
+    );
 
     let order_mode = format!("{:?}", config.arbitrage_order_type);
     let dashboard = DashboardHandle::new_live(order_mode, config.risk_max_exposure_usdc);
@@ -801,7 +804,8 @@ async fn main() -> Result<()> {
         });
 
         // Initialize orderbook monitor
-        let mut monitor = OrderBookMonitor::new();
+        let mut monitor =
+            OrderBookMonitor::with_max_pair_skew_ms(config.max_orderbook_pair_skew_ms);
 
         // Subscribe to all markets
         for market in &markets {

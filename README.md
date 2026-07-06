@@ -91,6 +91,7 @@ Get these from Polymarket → Settings → Builder.
 |----------|---------|-------------|
 | `CRYPTO_SYMBOLS` | `btc,eth,sol,xrp` | Symbols to monitor, comma-separated |
 | `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | Execute when `yes + no <= 1 - spread` |
+| `MAX_ORDERBOOK_PAIR_SKEW_MS` | `200` | Skip an arbitrage check when cached YES/NO book timestamps differ by more than this many milliseconds; restart required after changing |
 | `ARBITRAGE_MIN_AVAILABLE_SHARES` | `5.0` | Require capped available shares before submitting an arbitrage pair |
 | `ARBITRAGE_ORDER_SIZE_RATIO` | `1.0` | Submit this fraction of capped available shares; `0.8` sends 80% |
 | `SLIPPAGE` | `0,0.01` | Per-leg price buffer; adjusted `YES + NO` must still satisfy the execution spread |
